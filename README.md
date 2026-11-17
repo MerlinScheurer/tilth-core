@@ -1,5 +1,7 @@
 # tilth-core
 
+# Public Archive of the recently deleted: https://github.com/jahala/tilth-core
+
 The parsing substrate under [tilth](https://github.com/jahala/tilth), as a
 library. It detects a file's language, parses it with tree-sitter into outline
 entries and test structure, resolves imports, finds call sites, and analyses
