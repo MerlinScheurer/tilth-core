@@ -20,7 +20,7 @@ autoexamples = false
 autotests = false
 autobenches = false
 description = "The parsing substrate under tilth: tree-sitter outlines, language detection, imports, call sites and file-level dependencies."
-homepage = "https://jahala.github.io/tilth/"
+homepage = "https://github.com/MerlinScheurer/tilth-core"
 readme = "README.md"
 keywords = [
     "tree-sitter",
@@ -33,7 +33,7 @@ categories = [
     "parser-implementations",
 ]
 license = "MIT"
-repository = "https://github.com/jahala/tilth"
+repository = "https://github.com/MerlinScheurer/tilth-core"
 exclude = ["Cargo.toml.orig"]
 
 [features]
