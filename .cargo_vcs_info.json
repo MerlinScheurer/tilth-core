@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "e52c61e5bd711f839d4aac87a0b4f45b400b50f3"
+    "sha1": "075dfee07871c8d004db06fd61f4b5e340dfae1b"
   },
   "path_in_vcs": "crates/tilth-core"
 }

@@ -94,7 +94,7 @@ impl OutlineCache {
     }
 
     /// Parse a code file with tree-sitter and cache the result. Returns
-    /// `None` for non-code files, files larger than the 500 KB cap, or parse
+    /// `None` for non-code files, files larger than `source::MAX_FILE_SIZE`, or parse
     /// failures.
     ///
     /// Lookup and fill share one `entry()` for the same reason as
@@ -106,11 +106,11 @@ impl OutlineCache {
 
         let meta = std::fs::metadata(path).ok()?;
         let mtime = meta.modified().ok()?;
-        if meta.len() > 500_000 {
+        if meta.len() > crate::source::MAX_FILE_SIZE {
             return None;
         }
 
-        let mut slot = self.parsed.entry(path.to_path_buf());
+        let slot = self.parsed.entry(path.to_path_buf());
         if let Entry::Occupied(ref occupied) = slot {
             if occupied.get().mtime == mtime {
                 return Some(Arc::clone(&occupied.get().file));
@@ -123,8 +123,9 @@ impl OutlineCache {
         let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
             return None;
         };
+        let content = crate::source::read_source(path).ok()?;
+        let lang = crate::lang::refine_lang(lang, path, &content);
         let ts_lang = crate::lang::outline::outline_language(lang)?;
-        let content = std::fs::read_to_string(path).ok()?;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&ts_lang).ok()?;
         let tree = parser.parse(&content, None)?;
@@ -137,14 +138,7 @@ impl OutlineCache {
             mtime,
             file: Arc::clone(&file),
         };
-        match slot {
-            Entry::Occupied(ref mut occupied) => {
-                occupied.insert(entry);
-            }
-            Entry::Vacant(vacant) => {
-                vacant.insert(entry);
-            }
-        }
+        slot.insert(entry);
         Some(file)
     }
 }

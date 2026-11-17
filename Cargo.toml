@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "tilth-core"
-version = "0.13.0"
+version = "0.14.0"
 build = false
 autolib = false
 autobins = false
@@ -123,3 +123,34 @@ version = "0.23"
 
 [dev-dependencies.tempfile]
 version = "3"
+
+[target."cfg(unix)".dependencies.rustix]
+version = "1"
+features = ["fs"]
+
+[lints.clippy]
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+dbg_macro = "warn"
+expect_used = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+needless_collect = "warn"
+option_if_let_else = "warn"
+or_fun_call = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+redundant_clone = "warn"
+similar_names = "allow"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+use_self = "warn"
+
+[lints.clippy.pedantic]
+level = "warn"
+priority = -1

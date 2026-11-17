@@ -8,11 +8,11 @@ use std::fs;
 use std::path::Path;
 
 use tilth_core::{
-    analyze_deps, detect_file_type, extract_import_source, extract_imports, find_callers_batch,
-    get_outline_entries, is_external, is_import_line, is_test_file,
-    resolve_related_files_with_content, test_entries, BloomFilterCache, CallerMatch, Dependent,
-    DepsResult, FileType, Import, Lang, LocalDep, OutlineEntry, OutlineKind, TestEntry, TestKind,
-    TilthError,
+    analyze_deps, detect_file_type, detect_file_type_with_content, extract_import_source,
+    extract_imports, find_callers_batch, get_outline_entries, is_external, is_import_line,
+    is_test_file, resolve_related_files_with_content, test_entries, BloomFilterCache, CallerMatch,
+    Dependent, DepsResult, FileType, Import, Lang, LocalDep, OutlineEntry, OutlineKind, TestEntry,
+    TestKind, TilthError,
 };
 
 struct Sample {
@@ -59,6 +59,10 @@ const SAMPLES: &[Sample] = &[
     },
 ];
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "by design: a test helper, where a panic is the test failure"
+)]
 fn line_of(source: &str, needle: &str) -> u32 {
     let idx = source
         .lines()
@@ -96,6 +100,20 @@ fn detects_languages_by_path() {
         FileType::Code(Lang::JavaScript)
     );
     assert_eq!(detect_file_type(Path::new("notes.md")), FileType::Markdown);
+}
+
+#[test]
+fn a_header_is_detected_by_its_content() {
+    let header = Path::new("widget.h");
+    assert_eq!(detect_file_type(header), FileType::Code(Lang::C));
+    assert_eq!(
+        detect_file_type_with_content(header, "class Widget {\n};\n"),
+        FileType::Code(Lang::Cpp)
+    );
+    assert_eq!(
+        detect_file_type_with_content(header, "struct widget { int w; };\n"),
+        FileType::Code(Lang::C)
+    );
 }
 
 #[test]
@@ -302,7 +320,12 @@ fn callers_across_two_files_name_the_calling_function_and_line() {
     let bloom = BloomFilterCache::new();
     let targets: HashSet<String> = ["greet".to_string()].into_iter().collect();
     let found: Vec<(String, CallerMatch)> =
-        find_callers_batch(&targets, dir.path(), &bloom, None, 50).unwrap();
+        find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| sites)
+            .unwrap()
+            .per_file
+            .into_iter()
+            .flatten()
+            .collect();
     assert_eq!(found.len(), 1, "{found:?}");
     let (target, m) = &found[0];
     assert_eq!(target, "greet");
@@ -335,7 +358,8 @@ fn dependency_analysis_runs_on_a_file_in_scope() {
     let used_by: &Vec<Dependent> = &result.used_by;
     assert_eq!(used_by.len(), 1, "{used_by:?}");
     assert_eq!(used_by[0].path.file_name().unwrap(), "b.rs");
-    let _uses: &Vec<LocalDep> = &result.uses_local;
+    let uses: &Vec<LocalDep> = &result.uses_local;
+    assert!(uses.is_empty(), "a.rs imports nothing: {uses:?}");
 }
 
 #[test]

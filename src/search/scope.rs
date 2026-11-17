@@ -9,28 +9,10 @@ use std::path::Path;
 use crate::cache::OutlineCache;
 use crate::lang::elixir::{extract_elixir_definition_name, is_elixir_definition};
 use crate::lang::treesitter::{
-    extract_definition_name, node_text_simple, NodeTextMode, DEFINITION_KINDS,
+    binds_in_function, extract_definition_name, node_text_simple, NodeTextMode, DEFINITION_KINDS,
+    TYPE_KINDS,
 };
-
-/// Type-like node kinds that can enclose a function definition.
-const TYPE_KINDS: &[&str] = &[
-    "class_declaration",
-    "class_definition",
-    "class_specifier",
-    "struct_specifier",
-    "union_specifier",
-    "struct_item",
-    "impl_item",
-    "interface_declaration",
-    "trait_item",
-    "trait_declaration",
-    "type_declaration",
-    "enum_item",
-    "enum_declaration",
-    "module",
-    "mod_item",
-    "namespace_definition",
-];
+use crate::types::Lang;
 
 /// Resolved enclosing-definition context for a (file, line). Used by the
 /// search formatter to annotate usages with their containing scope.
@@ -43,53 +25,314 @@ pub struct EnclosingScope {
     pub name: String,
 }
 
-/// Walk up the AST from `node` to the nearest definition, qualified with its
-/// enclosing type/module if one wraps it. Returns the AST node so the caller
-/// can read its kind, plus the rendered name and line range.
+/// Walk up the AST from `node` to the nearest definition, qualified with the
+/// type that owns it (see [`definition_owner`]). Returns the AST node so the
+/// caller can read its kind, plus the rendered name and line range.
+///
+/// A variable declared in a function is not a definition here (see
+/// [`binds_in_function`]), so a node in its initializer belongs to the
+/// function: `const result = target()` inside `outer` is in `outer`. A
+/// JavaScript function value is a definition when it has a name of its own
+/// or is bound to one (see [`function_value_name`]); an anonymous callback is
+/// part of the function around it.
 pub(super) fn walk_to_enclosing_definition<'a>(
     node: tree_sitter::Node<'a>,
     lines: &[&str],
-    lang: crate::types::Lang,
+    lang: Lang,
 ) -> Option<(tree_sitter::Node<'a>, String, (u32, u32))> {
     let mut current = Some(node);
     while let Some(n) = current {
-        let def_name = if DEFINITION_KINDS.contains(&n.kind()) {
-            extract_definition_name(n, lines)
-        } else if lang == crate::types::Lang::Elixir && is_elixir_definition(n, lines) {
-            extract_elixir_definition_name(n, lines)
-        } else {
-            None
-        };
-
-        if let Some(name) = def_name {
+        if let Some(name) = definition_name(n, lines, lang) {
             let range = (
                 n.start_position().row as u32 + 1,
                 n.end_position().row as u32 + 1,
             );
-
-            // Walk further up to find an enclosing type/module and qualify the name.
-            // `defmodule` is a `call` node, not in TYPE_KINDS, so Elixir needs a
-            // separate check to produce `Module.func`.
-            let mut parent = n.parent();
-            while let Some(p) = parent {
-                if TYPE_KINDS.contains(&p.kind()) {
-                    if let Some(type_name) = extract_definition_name(p, lines) {
-                        return Some((n, format!("{type_name}.{name}"), range));
-                    }
-                }
-                if lang == crate::types::Lang::Elixir && is_elixir_definition(p, lines) {
-                    if let Some(type_name) = extract_elixir_definition_name(p, lines) {
-                        return Some((n, format!("{type_name}.{name}"), range));
-                    }
-                }
-                parent = p.parent();
-            }
-
+            let name = match definition_owner(n, lines, lang) {
+                Some(owner) => format!("{owner}.{name}"),
+                None => name,
+            };
             return Some((n, name, range));
         }
         current = n.parent();
     }
     None
+}
+
+/// The name `node` defines, if it is a definition a caller label can name:
+/// a definition that is not a local binding, a named or bound JavaScript
+/// function value, or an Elixir `def`. The label is this name, qualified
+/// with the [`definition_owner`].
+pub(super) fn definition_name(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+) -> Option<String> {
+    if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
+        && FUNCTION_VALUE_KINDS.contains(&node.kind())
+    {
+        function_value_name(node, lines)
+    } else if DEFINITION_KINDS.contains(&node.kind()) && !binds_in_function(node) {
+        extract_definition_name(node, lines)
+    } else if lang == Lang::Elixir && is_elixir_definition(node, lines) {
+        extract_elixir_definition_name(node, lines)
+    } else {
+        None
+    }
+}
+
+/// JavaScript and TypeScript functions written as values.
+const FUNCTION_VALUE_KINDS: &[&str] = &[
+    "function_expression",
+    "function",
+    "arrow_function",
+    "generator_function",
+];
+
+/// The name a function value goes by: its own (`function send() {}`), or
+/// the name it is bound to (`const send = () => {}`, `res.send = function
+/// () {}`, `{ send() {} }`'s key, a class field). `None` for an anonymous
+/// callback.
+fn function_value_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let text = |n: tree_sitter::Node| Some(node_text_simple(n, lines, NodeTextMode::Full));
+    if let Some(name) = node.child_by_field_name("name") {
+        return text(name);
+    }
+    let parent = node.parent()?;
+    let bound = match parent.kind() {
+        "variable_declarator" => parent.child_by_field_name("name"),
+        "assignment_expression" => parent.child_by_field_name("left").and_then(|left| {
+            if left.kind() == "member_expression" {
+                left.child_by_field_name("property")
+            } else {
+                Some(left)
+            }
+        }),
+        "pair" => parent.child_by_field_name("key"),
+        "public_field_definition" | "field_definition" => parent
+            .child_by_field_name("name")
+            .or_else(|| parent.child_by_field_name("property")),
+        _ => None,
+    }?;
+    matches!(
+        bound.kind(),
+        "identifier" | "property_identifier" | "private_property_identifier"
+    )
+    .then(|| text(bound))
+    .flatten()
+}
+
+/// The name of the type or module that owns definition `node`, if any: the
+/// nearest enclosing class, struct, trait, interface, module or Rust `impl`
+/// (by its type), a Go method's receiver type, or the class a C++ member
+/// defined outside it names (`int B::run()`). Elixir's `defmodule` is a
+/// `call`, so it is checked apart. This is the owner a qualified name such as
+/// `B::run` or `Context.reset` names.
+#[must_use]
+pub fn definition_owner(node: tree_sitter::Node, lines: &[&str], lang: Lang) -> Option<String> {
+    if let Some(owner) = receiver_type(node, lines).or_else(|| declarator_scope(node, lines)) {
+        return Some(owner);
+    }
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if TYPE_KINDS.contains(&p.kind()) {
+            let name = if p.kind() == "impl_item" {
+                p.child_by_field_name("type")
+                    .and_then(|t| base_type_name(t, lines))
+            } else {
+                extract_definition_name(p, lines)
+            };
+            if name.is_some() {
+                return name;
+            }
+        }
+        if lang == Lang::Elixir && is_elixir_definition(p, lines) {
+            if let Some(name) = extract_elixir_definition_name(p, lines) {
+                return Some(name);
+            }
+        }
+        parent = p.parent();
+    }
+    None
+}
+
+/// Split a qualified name into its owner and its bare name, at the last `::`
+/// or `.`: `B::run` and `B.run` give `(Some("B"), "run")`, and
+/// `crate::m::B::run` gives `(Some("B"), "run")` too, since the owner is the
+/// type that holds the name. A name without a qualifier, or with an empty
+/// segment on either side of the last separator, is returned whole with no
+/// owner. Labels from [`walk_to_enclosing_definition`] use `.`, so this also
+/// splits them.
+#[must_use]
+pub fn split_qualified(name: &str) -> (Option<&str>, &str) {
+    let Some(cut) = name.rfind(['.', ':']) else {
+        return (None, name);
+    };
+    let bare = &name[cut + 1..];
+    let head = if name[..=cut].ends_with("::") {
+        &name[..cut - 1]
+    } else if name[..=cut].ends_with('.') {
+        &name[..cut]
+    } else {
+        return (None, name);
+    };
+    let owner = head.rsplit(['.', ':']).next().unwrap_or(head);
+    if is_word(owner) && is_member_name(bare) && !head.ends_with(':') {
+        (Some(owner), bare)
+    } else {
+        (None, name)
+    }
+}
+
+/// An identifier: letters, digits, `_` and `$`.
+fn is_word(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// A name a member can have: an identifier, optionally led by `#` (a JS
+/// private member) or `~` (a C++ destructor), and optionally ending in `?`,
+/// `!` or `=` (Ruby's `valid?`, `save!` and `name=`).
+fn is_member_name(s: &str) -> bool {
+    let s = s.strip_prefix(['#', '~']).unwrap_or(s);
+    let s = s.strip_suffix(['?', '!', '=']).unwrap_or(s);
+    is_word(s)
+}
+
+/// Qualifiers that name the type or instance a call is written in, not a
+/// type by its name: `Self::new`, `self.run`, `this.handle`, `cls.build`.
+const SELF_QUALIFIERS: &[&str] = &["Self", "self", "this", "cls"];
+
+/// The segments of a qualified name, at every `::` and `.`:
+/// `crate::m::A::run` gives `crate`, `m`, `A`, `run`. A name
+/// [`split_qualified`] does not split is one segment.
+fn segments(name: &str) -> Vec<&str> {
+    if split_qualified(name).0.is_none() {
+        return vec![name];
+    }
+    name.split("::").flat_map(|s| s.split('.')).collect()
+}
+
+/// Whether `query` names the definition called `defined` that `owner`
+/// holds (`None` when no type or module holds it). The qualified path of
+/// the definition is its owner's segments, then its own: `MyApp.Accounts`
+/// holding `get_user` is `MyApp`, `Accounts`, `get_user`, and an Elixir
+/// `defmodule MyApp.Accounts` is `MyApp`, `Accounts`. The query names it
+/// when the two agree on every segment they both have, counted from the
+/// end, so `Accounts.get_user` and `crate::m::A::run` name `A`'s `run`.
+/// A bare query takes any owner. A qualified query needs an owner to
+/// compare. A qualifier from [`SELF_QUALIFIERS`] stands for whatever type
+/// holds the name, so it matches any owner, and never a definition with
+/// none.
+#[must_use]
+pub fn names_definition(query: &str, defined: &str, owner: Option<&str>) -> bool {
+    let wanted = segments(query);
+    let mut path: Vec<&str> = owner.map(segments).unwrap_or_default();
+    path.extend(segments(defined));
+    if wanted.len() == 2 && SELF_QUALIFIERS.contains(&wanted[0]) {
+        return owner.is_some() && path.last() == wanted.last();
+    }
+    let shared = wanted.len().min(path.len());
+    (wanted.len() == 1 || shared >= 2)
+        && wanted[wanted.len() - shared..] == path[path.len() - shared..]
+}
+
+/// Whether `qualifier` names the module a top-level definition in `path`
+/// belongs to: the file's stem (`symbol` for `symbol.rs`, `gin` for
+/// `gin.go`), its directory (`utils` for `utils/mod.rs` or
+/// `utils/__init__.py`), or a Go file's package (`gin` in
+/// `package gin`). `gin.New`, `crate::search::symbol::search` and
+/// `os.path.join` name a function by its module, which is not an owner a
+/// definition carries.
+#[must_use]
+pub fn names_module(qualifier: &str, path: &Path, root: tree_sitter::Node, lines: &[&str]) -> bool {
+    let name_of = |p: Option<&std::ffi::OsStr>| p.and_then(|s| s.to_str()) == Some(qualifier);
+    if name_of(path.file_stem()) || name_of(path.parent().and_then(Path::file_name)) {
+        return true;
+    }
+    let mut cursor = root.walk();
+    let package = root
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "package_clause");
+    package.is_some_and(|clause| {
+        let mut cursor = clause.walk();
+        let found = clause
+            .named_children(&mut cursor)
+            .any(|n| node_text_simple(n, lines, NodeTextMode::Full) == qualifier);
+        found
+    })
+}
+
+/// A Go method's receiver type: `Context` in `func (c *Context) reset()`.
+fn receiver_type(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    if node.kind() != "method_declaration" {
+        return None;
+    }
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let param = receiver
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "parameter_declaration")?;
+    base_type_name(param.child_by_field_name("type")?, lines)
+}
+
+/// The class a C or C++ function definition names in its declarator, as
+/// `B` in `int B::run()` or `int ns::B::run()`.
+fn declarator_scope(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let mut declarator = node.child_by_field_name("declarator");
+    while let Some(d) = declarator {
+        if d.kind() == "qualified_identifier" {
+            let mut qualified = d;
+            while let Some(inner) = qualified
+                .child_by_field_name("name")
+                .filter(|n| n.kind() == "qualified_identifier")
+            {
+                qualified = inner;
+            }
+            return base_type_name(qualified.child_by_field_name("scope")?, lines);
+        }
+        if !d.kind().ends_with("declarator") {
+            return None;
+        }
+        // A reference declarator (`const T& B::name()`) holds its inner
+        // declarator as an unnamed child, not in a `declarator` field.
+        declarator = d.child_by_field_name("declarator").or_else(|| {
+            let mut cursor = d.walk();
+            let inner = d
+                .named_children(&mut cursor)
+                .find(|c| c.kind().ends_with("declarator") || c.kind() == "qualified_identifier");
+            inner
+        });
+    }
+    None
+}
+
+/// The bare name of a type node: `Wrap` for `Wrap<T>`, `Foo` for
+/// `crate::a::Foo`, `*Foo` or `&Foo`.
+fn base_type_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" | "namespace_identifier" | "constant" => {
+            Some(node_text_simple(node, lines, NodeTextMode::Full))
+        }
+        "generic_type" | "reference_type" => base_type_name(
+            node.child_by_field_name("type")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| node.named_child(0))?,
+            lines,
+        ),
+        "scoped_type_identifier" | "qualified_type" | "template_type" | "scoped_identifier" => {
+            base_type_name(node.child_by_field_name("name")?, lines)
+        }
+        "pointer_type" => {
+            let mut cursor = node.walk();
+            let pointee = node.named_children(&mut cursor).last()?;
+            base_type_name(pointee, lines)
+        }
+        _ => None,
+    }
 }
 
 /// Find the nearest enclosing definition for `(path, line)` by re-parsing
@@ -131,29 +374,53 @@ pub fn enclosing_definition_at(
 /// Map a tree-sitter definition node to a short user-facing label. Every kind
 /// we handle is enumerated here, so adding a new language grammar is "add the
 /// node kind to this match" with no string heuristics elsewhere.
-fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang) -> &'static str {
+fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: Lang) -> &'static str {
     match node.kind() {
         "function_declaration"
         | "function_definition"
         | "function_item"
+        | "generator_function_declaration"
         | "method_definition"
         | "method_declaration"
-        | "decorated_definition" => "function",
-        "class_declaration" | "class_definition" => "class",
-        "struct_item" => "struct",
+        | "method"
+        | "singleton_method"
+        | "function_signature_item"
+        | "method_signature"
+        | "abstract_method_signature"
+        | "function_signature"
+        | "protocol_function_declaration"
+        | "decorated_definition"
+        | "function_expression"
+        | "function"
+        | "arrow_function"
+        | "generator_function" => "function",
+        "class_declaration"
+        | "class_definition"
+        | "abstract_class_declaration"
+        | "class"
+        | "record_declaration"
+        | "annotation_type_declaration" => "class",
+        "struct_item" | "struct_declaration" | "union_item" => "struct",
         "interface_declaration" => "interface",
-        "trait_declaration" | "trait_item" => "trait",
+        "trait_declaration" | "trait_item" | "trait_definition" => "trait",
+        "protocol_declaration" => "protocol",
         "type_alias_declaration" | "type_item" | "type_declaration" => "type",
         "enum_item" | "enum_declaration" => "enum",
-        "lexical_declaration" | "variable_declaration" => "variable",
-        "const_item" | "const_declaration" => "const",
+        "lexical_declaration" | "variable_declaration" | "var_definition" => "variable",
+        "const_item" | "const_declaration" | "val_definition" => "const",
         "static_item" => "static",
         "property_declaration" => "property",
-        "mod_item" | "namespace_definition" => "module",
-        "object_declaration" => "object",
+        "mod_item"
+        | "namespace_definition"
+        | "namespace_declaration"
+        | "file_scoped_namespace_declaration"
+        | "internal_module"
+        | "module" => "module",
+        "macro_definition" => "macro",
+        "object_declaration" | "object_definition" => "object",
         "impl_item" => "impl",
         "export_statement" => "export",
-        "call" if lang == crate::types::Lang::Elixir => elixir_kind_label(node, lines),
+        "call" if lang == Lang::Elixir => elixir_kind_label(node, lines),
         _ => "definition",
     }
 }
@@ -187,6 +454,29 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn split_qualified_takes_the_last_segment_and_its_owner() {
+        for (name, owner, bare) in [
+            ("Type::method", Some("Type"), "method"),
+            ("Type.method", Some("Type"), "method"),
+            ("a::b::method", Some("b"), "method"),
+            ("a.b::method", Some("b"), "method"),
+            ("a::b.method", Some("b"), "method"),
+            ("café::méthode", Some("café"), "méthode"),
+            ("类型.方法", Some("类型"), "方法"),
+            ("method", None, "method"),
+            ("メソッド", None, "メソッド"),
+            ("Type::", None, "Type::"),
+            ("Type.", None, "Type."),
+            ("::method", None, "::method"),
+            ("a:b", None, "a:b"),
+            ("a:::b", None, "a:::b"),
+            ("a..b", None, "a..b"),
+        ] {
+            assert_eq!(split_qualified(name), (owner, bare), "{name}");
+        }
     }
 
     #[test]
@@ -347,13 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn enclosing_at_rust_impl_block_does_not_qualify_with_type() {
-        // tree-sitter-rust's `impl_item` exposes its type via a `type` field,
-        // not via the `name`/`identifier`/`declarator` fields that
-        // extract_definition_name probes. So methods inside `impl Foo {...}`
-        // produce the bare function name, not `"Foo.bar"`. Pre-existing
-        // behavior of find_enclosing_function — pinned here so a future
-        // qualifier improvement is an intentional, visible change.
+    fn enclosing_at_rust_impl_block_qualifies_with_its_type() {
+        // tree-sitter-rust's `impl_item` names its type in a `type` field, not
+        // a `name`. A method inside `impl Foo {...}` is still `Foo.bar`, the
+        // way a TypeScript method is `Class.method`, so a label can be passed
+        // back to grok as a qualified name.
         let tmp = tempfile::tempdir().unwrap();
         let p = write(
             tmp.path(),
@@ -363,7 +651,7 @@ mod tests {
         let cache = OutlineCache::new();
         let scope = enclosing_definition_at(&p, 4, &cache).unwrap();
         assert_eq!(scope.kind, "function");
-        assert_eq!(scope.name, "bar");
+        assert_eq!(scope.name, "Foo.bar");
     }
 
     #[test]
@@ -392,6 +680,40 @@ mod tests {
             let scope = enclosing_definition_at(&p, line, &cache).unwrap();
             assert_eq!(scope.kind, "function", "line {line}");
             assert_eq!(scope.name, name, "line {line}");
+        }
+    }
+
+    #[test]
+    fn a_cpp_member_returning_a_reference_names_its_class() {
+        // `const std::string& B::name()` wraps the qualified name in a
+        // reference declarator, as `int* B::ptr()` wraps it in a pointer one.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(
+            tmp.path(),
+            "b.cpp",
+            "const std::string& B::name() {\n  return s;\n}\nint* B::ptr() {\n  return 0;\n}\n",
+        );
+        let cache = OutlineCache::new();
+        for (line, name) in [(2, "B.name"), (5, "B.ptr")] {
+            let scope = enclosing_definition_at(&p, line, &cache).unwrap();
+            assert_eq!(scope.name, name, "line {line}");
+        }
+    }
+
+    #[test]
+    fn split_qualified_splits_member_names_with_marks() {
+        // Ruby's `?`, `!` and `=` methods, a JS private member and a C++
+        // destructor are member names a label can carry.
+        for (name, owner, bare) in [
+            ("User.save!", Some("User"), "save!"),
+            ("Cart.valid?", Some("Cart"), "valid?"),
+            ("User.name=", Some("User"), "name="),
+            ("Counter.#count", Some("Counter"), "#count"),
+            ("Shape::~Shape", Some("Shape"), "~Shape"),
+            ("User.!", None, "User.!"),
+            ("User.#", None, "User.#"),
+        ] {
+            assert_eq!(split_qualified(name), (owner, bare), "{name}");
         }
     }
 }

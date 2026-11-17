@@ -193,7 +193,7 @@ pub fn resolve_callees(
         return Vec::new();
     }
 
-    let file_type = crate::lang::detect_file_type(source_path);
+    let file_type = crate::lang::detect_file_type_with_content(source_path, source_content);
     let crate::types::FileType::Code(lang) = file_type else {
         return Vec::new();
     };
@@ -224,12 +224,12 @@ pub fn resolve_callees(
             &import_path,
             remaining.iter().copied(),
             bloom,
-            super::bloom_walk::MAX_FILE_SIZE,
+            crate::source::MAX_FILE_SIZE,
         ) else {
             continue;
         };
 
-        let import_type = crate::lang::detect_file_type(&import_path);
+        let import_type = crate::lang::detect_file_type_with_content(&import_path, &import_content);
         let crate::types::FileType::Code(import_lang) = import_type else {
             continue;
         };
@@ -261,7 +261,9 @@ fn resolve_same_package(
     source_path: &Path,
 ) {
     const MAX_FILES: usize = 20;
-    const MAX_FILE_SIZE: u64 = 100_000; // 100KB
+    // A tighter bound than `source::MAX_FILE_SIZE`: this scan parses up to
+    // `MAX_FILES` siblings on every expansion, not one file a query names.
+    const MAX_SIBLING_SIZE: u64 = 100_000;
 
     let Some(dir) = source_path.parent() else {
         return;
@@ -281,7 +283,7 @@ fn resolve_same_package(
             path != source_path
                 && name_str.ends_with(".go")
                 && !name_str.ends_with("_test.go")
-                && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_SIZE)
+                && e.metadata().is_ok_and(|m| m.len() <= MAX_SIBLING_SIZE)
         })
         .map(|e| e.path())
         .collect();
@@ -294,7 +296,7 @@ fn resolve_same_package(
             break;
         }
 
-        let Ok(content) = std::fs::read_to_string(&go_path) else {
+        let Ok(content) = crate::source::read_source(&go_path) else {
             continue;
         };
 
@@ -366,12 +368,11 @@ fn resolve_second_hop(
     visited: &mut HashSet<(PathBuf, u32)>,
     budget: &mut usize,
 ) -> Vec<ResolvedCallee> {
-    let file_type = crate::lang::detect_file_type(&parent.file);
-    let crate::types::FileType::Code(lang) = file_type else {
+    let Ok(content) = crate::source::read_source(&parent.file) else {
         return Vec::new();
     };
-
-    let Ok(content) = std::fs::read_to_string(&parent.file) else {
+    let file_type = crate::lang::detect_file_type_with_content(&parent.file, &content);
+    let crate::types::FileType::Code(lang) = file_type else {
         return Vec::new();
     };
 

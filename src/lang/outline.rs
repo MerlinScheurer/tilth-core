@@ -115,7 +115,7 @@ fn push_entries(
     depth: usize,
     out: &mut Vec<OutlineEntry>,
 ) {
-    if is_or_body_of(node, PASS_THROUGH_KINDS) {
+    if is_or_body_of(node, node.parent(), PASS_THROUGH_KINDS) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             push_entries(child, lines, lang, depth, out);
@@ -126,12 +126,21 @@ fn push_entries(
 }
 
 /// Convert a tree-sitter node to an `OutlineEntry` based on its kind.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one name extractor replaces the per-kind branches in #310"
+)]
 fn node_to_entry(
     node: tree_sitter::Node,
     lines: &[&str],
     lang: Lang,
     depth: usize,
 ) -> Option<OutlineEntry> {
+    // A keyword token is never an entry: Ruby's `class` keyword has the kind
+    // of the class it opens.
+    if !node.is_named() {
+        return None;
+    }
     let kind_str = node.kind();
     let start_line = node.start_position().row as u32 + 1;
     let end_line = node.end_position().row as u32 + 1;
@@ -141,12 +150,16 @@ fn node_to_entry(
         "function_declaration"
         | "function_definition"
         | "function_item"
+        | "generator_function_declaration"
         | "method_definition"
         | "method_declaration"
         | "constructor_declaration"
         | "init_declaration"
         | "deinit_declaration"
-        | "protocol_function_declaration" => {
+        | "protocol_function_declaration"
+        | "abstract_method_signature"
+        | "method"
+        | "singleton_method" => {
             let name = extract_definition_name(node, lines).unwrap_or_else(|| {
                 // Swift deinit has no name field — use the node kind as name
                 if kind_str == "deinit_declaration" {
@@ -159,8 +172,9 @@ fn node_to_entry(
             (OutlineKind::Function, name, Some(sig))
         }
 
-        // Classes & structs
-        "class_declaration" | "class_definition" => {
+        // Classes & structs. `class` is Ruby's; a JS/TS class expression
+        // never sits where outline entries are read.
+        "class_declaration" | "class_definition" | "abstract_class_declaration" | "class" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
@@ -243,12 +257,14 @@ fn node_to_entry(
             let name = find_child_text(node, "name", lines)
                 .or_else(|| first_identifier_text(node, lines))
                 .unwrap_or_else(|| "<property>".into());
-            let sig = extract_signature(node, lines);
+            let sig = first_line_signature(node, lines);
             (OutlineKind::Property, name, Some(sig))
         }
 
         // Imports — collect as a group
         "import_statement"
+        | "import_from_statement"
+        | "future_import_statement"
         | "import_declaration"
         | "import"
         | "use_declaration"
@@ -259,24 +275,31 @@ fn node_to_entry(
             (OutlineKind::Import, text, None)
         }
 
-        // Exports — `export` is a modifier on a wrapped declaration, not a
-        // peer of `function`/`class`/`const`. Recurse into the inner
-        // declaration so the entry renders with its real kind. Falling back to
-        // `OutlineKind::Export` only when there is no nameable declaration
-        // inside (`export { … }`, `export * from …`, `export default <expr>`).
-        // Without this, `export_statement`'s `name` is the full source span
-        // (already starts with `export `), and the renderer prepends the
-        // `Export` kind_label `"export"` again — producing the doubled-keyword
-        // outline header `export export async function foo(`.
-        "export_statement" => {
+        // Wrappers — `export` and Python decorators are modifiers on a wrapped
+        // declaration, not peers of `function`/`class`/`const`. Recurse into
+        // the inner declaration so the entry renders with its real kind. An
+        // `export` shares the declaration's line, so the entry's range is
+        // extended to cover it and still points at the whole statement. A
+        // decorated entry keeps the `def`/`class` line as its first line, the
+        // line every view prints for it. An `export` with no nameable declaration inside
+        // (`export { … }`, `export * from …`, `export default <expr>`) falls
+        // back to `OutlineKind::Export`. Without the unwrap,
+        // `export_statement`'s `name` is the full source span (already starts
+        // with `export `), and the renderer prepends the `Export` kind_label
+        // `"export"` again — producing the doubled-keyword outline header
+        // `export export async function foo(`.
+        "export_statement" | "decorated_definition" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if let Some(mut inner) = node_to_entry(child, lines, lang, depth) {
-                    // Extend the entry's range to cover the `export` keyword
-                    // so the outline byte range still points at the statement.
-                    inner.start_line = start_line;
+                    if kind_str == "export_statement" {
+                        inner.start_line = start_line;
+                    }
                     return Some(inner);
                 }
+            }
+            if kind_str == "decorated_definition" {
+                return None;
             }
             // No nameable inner declaration; strip leading `export ` so the
             // rendered name doesn't duplicate the `kind_label`.
@@ -394,8 +417,158 @@ fn collect_children(
     children
 }
 
-/// Extract the first line as a function signature (name + params + return type).
+/// A function's signature: its name, parameters and return type, on one
+/// line. A signature written across lines reads from its first line to
+/// where its body starts, each line trimmed and joined, without its
+/// comments.
 fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
+    let header = header_lines(node, lines);
+    if header.len() > 1 {
+        return elide_middle(&join_signature_lines(&header));
+    }
+    first_line_signature(node, lines)
+}
+
+/// Longest signature an outline prints whole. A one-line signature past it
+/// is cut at its end; a joined one loses its middle and keeps its end,
+/// which holds the return type. fastapi's `APIRouter.get` header runs to
+/// 14,000 characters of documented parameters.
+const MAX_SIGNATURE: usize = 120;
+
+/// `signature` with its middle replaced by `…` when it is longer than
+/// `MAX_SIGNATURE`: three quarters of the room for its start, the rest for
+/// its end.
+fn elide_middle(signature: &str) -> String {
+    if signature.len() <= MAX_SIGNATURE {
+        return signature.to_string();
+    }
+    let head = signature.floor_char_boundary(MAX_SIGNATURE * 3 / 4);
+    let tail = signature.ceil_char_boundary(signature.len() - MAX_SIGNATURE / 4);
+    format!(
+        "{} … {}",
+        signature[..head].trim_end(),
+        signature[tail..].trim_start()
+    )
+}
+
+/// The non-blank lines of a function's header, trimmed and without its
+/// comments: from the line it starts on to where its body starts, or to
+/// its end when it has no body (an abstract or interface method). Empty
+/// when the header fits on its first line.
+fn header_lines(node: tree_sitter::Node, lines: &[&str]) -> Vec<String> {
+    let start_row = node.start_position().row;
+    let body = function_body(node);
+    let end = match body {
+        Some(body) => body.start_position(),
+        // An Elixir `def f(x), do: …` is a call whose keyword body is
+        // read by `first_line_signature`.
+        None if node.kind() == "call" => return Vec::new(),
+        None => node.end_position(),
+    };
+    if end.row == start_row {
+        return Vec::new();
+    }
+    let mut comments = Vec::new();
+    header_comments(node, body, &mut comments);
+    let mut out = Vec::new();
+    let last = end.row.min(lines.len().saturating_sub(1));
+    for (row, &line) in lines.iter().enumerate().take(last + 1).skip(start_row) {
+        let to = if row == end.row {
+            end.column.min(line.len())
+        } else {
+            line.len()
+        };
+        let mut text = String::new();
+        let mut from = 0;
+        for comment in &comments {
+            let (c_start, c_end) = (comment.start_position(), comment.end_position());
+            if row < c_start.row || row > c_end.row {
+                continue;
+            }
+            let cut_from = if row == c_start.row {
+                c_start.column
+            } else {
+                0
+            };
+            let cut_to = if row == c_end.row {
+                c_end.column
+            } else {
+                line.len()
+            };
+            text.push_str(line.get(from..cut_from.min(to)).unwrap_or(""));
+            from = cut_to.max(from);
+        }
+        text.push_str(line.get(from.min(to)..to).unwrap_or(""));
+        let text = text.trim();
+        if !text.is_empty() {
+            out.push(text.to_string());
+        }
+    }
+    out
+}
+
+/// The comment nodes inside a function's header, in source order: every
+/// descendant of `node` outside `body` whose kind is a comment.
+fn header_comments<'t>(
+    node: tree_sitter::Node<'t>,
+    body: Option<tree_sitter::Node<'t>>,
+    out: &mut Vec<tree_sitter::Node<'t>>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if Some(child) == body {
+            continue;
+        }
+        if child.kind().contains("comment") {
+            out.push(child);
+        } else {
+            header_comments(child, body, out);
+        }
+    }
+}
+
+/// The node a function's body starts at: its `body` field, or the child
+/// that holds the body in grammars without one (Kotlin's `function_body`,
+/// Elixir's `do_block`).
+fn function_body(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if let Some(body) = node.child_by_field_name("body") {
+        return Some(body);
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .find(|c| matches!(c.kind(), "function_body" | "do_block"));
+    found
+}
+
+/// Header lines joined into one: no space inside brackets, and the
+/// trailing comma a formatter puts before a closing bracket dropped, so a
+/// signature reads the same however it is wrapped. A trailing `{`, the
+/// Python `:` and a Rust `where` clause's last comma go too.
+fn join_signature_lines(header: &[String]) -> String {
+    let mut out = String::new();
+    for part in header {
+        let closes = part.starts_with([')', ']', '>', '}']);
+        if closes && out.ends_with(',') {
+            out.pop();
+        }
+        let opens = out.ends_with(['(', '[', '<', '{']);
+        if !out.is_empty() && !closes && !opens {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    let trimmed = out
+        .trim_end()
+        .trim_end_matches(';')
+        .trim_end_matches('{')
+        .trim_end();
+    let trimmed = trimmed.strip_suffix(':').unwrap_or(trimmed);
+    trimmed.trim_end().trim_end_matches(',').to_string()
+}
+
+/// The signature read off the node's first line alone.
+fn first_line_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
     let start_row = node.start_position().row;
     if start_row < lines.len() {
         let line = lines[start_row].trim();
@@ -422,8 +595,8 @@ fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
             return line[..pos].trim().to_string();
         }
         // Full first line, truncated
-        if line.len() > 120 {
-            format!("{}...", crate::types::truncate_str(line, 117))
+        if line.len() > MAX_SIGNATURE {
+            format!("{}...", crate::types::truncate_str(line, MAX_SIGNATURE - 3))
         } else {
             line.to_string()
         }
@@ -489,20 +662,56 @@ fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<Stri
     None
 }
 
-/// Extract a doc comment from the previous sibling.
+/// The doc comment above `node`: the comment right before it, and the
+/// comments directly above that one, line after line. Line comments (`//`,
+/// `///`, `#`) are one node per line, so a doc written in them is several
+/// comments; reading only the nearest kept a doc's last line alone. Each
+/// comment starts its own line, so one that trails the statement before
+/// `node` is no doc. The comments above the nearest touch the one below
+/// them: a blank line ends the doc. The nearest may sit a blank line above
+/// `node`, as a `/** */` block often does in JavaScript.
 fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    let prev = node.prev_sibling()?;
-    let kind = prev.kind();
-    if kind.contains("comment") || kind.contains("doc") {
-        let cleaned = clean_comment_text(&node_rows_text(prev, lines));
-        if cleaned.is_empty() {
-            None
+    let is_comment = |n: tree_sitter::Node| {
+        let kind = n.kind();
+        kind.contains("comment") || kind.contains("doc")
+    };
+    let starts_its_line = |n: tree_sitter::Node| {
+        let start = n.start_position();
+        lines
+            .get(start.row)
+            .and_then(|line| line.get(..start.column))
+            .is_some_and(|before| before.trim().is_empty())
+    };
+    // `above` ends on the line before `below` starts. A Rust line comment
+    // ends after its newline, at column 0 of the next line.
+    let touches = |above: tree_sitter::Node, below: tree_sitter::Node| {
+        let end = above.end_position();
+        let last_row = if end.column == 0 && end.row > above.start_position().row {
+            end.row - 1
         } else {
-            Some(cleaned)
+            end.row
+        };
+        last_row + 1 == below.start_position().row
+    };
+    let nearest = node
+        .prev_sibling()
+        .filter(|p| is_comment(*p) && starts_its_line(*p))?;
+    let mut block = vec![nearest];
+    let mut top = nearest;
+    while let Some(above) = top.prev_sibling() {
+        if !(is_comment(above) && touches(above, top) && starts_its_line(above)) {
+            break;
         }
-    } else {
-        None
+        block.push(above);
+        top = above;
     }
+    let parts: Vec<String> = block
+        .iter()
+        .rev()
+        .map(|c| clean_comment_text(&node_rows_text(*c, lines)))
+        .filter(|text| !text.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// Every line a node spans, joined with newlines. `node_text_simple` returns
@@ -1563,10 +1772,167 @@ mod doc_comment_tests {
         assert!(!doc.contains('*'), "delimiters must be gone: {doc:?}");
         assert!(!doc.contains('\n'), "must be one line: {doc:?}");
     }
+
+    /// A doc written in line comments is one comment node per line. Reading
+    /// only the nearest node kept the doc's last line: `Second sentence.`
+    /// A blank line or a comment that trails code ends the doc.
+    #[test]
+    fn a_doc_of_line_comments_keeps_every_line() {
+        assert_eq!(
+            first_doc(
+                "package p\n\n// Public does a thing.\n// Second sentence.\nfunc Public() {}\n",
+                Lang::Go
+            ),
+            Some("Public does a thing. Second sentence.".to_string())
+        );
+        assert_eq!(
+            first_doc("/// First line.\n/// Second line.\nfn f() {}\n", Lang::Rust),
+            Some("First line. Second line.".to_string())
+        );
+        assert_eq!(
+            first_doc(
+                "# Section heading\n\n# Doc of f.\n# More.\ndef f():\n    pass\n",
+                Lang::Python
+            ),
+            Some("Doc of f. More.".to_string())
+        );
+        let grouped =
+            "package p\n\nconst (\n\tA = 1 // trails A\n\t// B is documented.\n\tB = 2\n)\n";
+        let entries = get_outline_entries(grouped, Lang::Go);
+        let b = entries.iter().find(|e| e.name == "B").expect("B");
+        assert_eq!(b.doc.as_deref(), Some("B is documented."));
+    }
+
+    /// A comment that trails the statement before a definition documents
+    /// that statement. A comment on its own lines a blank line above stays
+    /// the doc, the way a `/** */` block above a function often sits.
+    #[test]
+    fn a_comment_trailing_code_is_no_doc() {
+        let entries = get_outline_entries(
+            "TIMEOUT = 3  # seconds\ndef fetch():\n    return TIMEOUT\n",
+            Lang::Python,
+        );
+        assert_eq!(
+            entries.iter().find(|e| e.name == "fetch").unwrap().doc,
+            None
+        );
+        assert_eq!(
+            first_doc("int x = 1; /* x */\nint f(void) { return 0; }\n", Lang::C),
+            None
+        );
+        assert_eq!(
+            first_doc(
+                "/**\n * Create an app.\n */\n\nfunction createApp() {}\n",
+                Lang::JavaScript
+            ),
+            Some("Create an app.".to_string())
+        );
+    }
 }
 
 #[cfg(test)]
-mod c_family_outline_tests {
+mod signature_tests {
+    use super::get_outline_entries;
+    use crate::types::Lang;
+    use std::fmt::Write as _;
+
+    fn signature_of(src: &str, lang: Lang, name: &str) -> Option<String> {
+        fn find(entries: &[crate::types::OutlineEntry], name: &str) -> Option<String> {
+            entries.iter().find_map(|e| {
+                if e.name == name {
+                    e.signature.clone()
+                } else {
+                    find(&e.children, name)
+                }
+            })
+        }
+        find(&get_outline_entries(src, lang), name)
+    }
+
+    /// A signature written across lines reads to where the body starts.
+    /// Read off the first line alone, it was `pub fn multiline_handler(`.
+    #[test]
+    fn a_multiline_signature_is_read_whole() {
+        let rust = "pub fn multiline_handler(\n    request: &str,\n    retries: u8,\n) -> Result<usize, &'static str> {\n    Ok(1)\n}\n";
+        assert_eq!(
+            signature_of(rust, Lang::Rust, "multiline_handler").as_deref(),
+            Some("pub fn multiline_handler(request: &str, retries: u8) -> Result<usize, &'static str>")
+        );
+        let where_clause = "fn f<T>(x: T) -> T\nwhere\n    T: Clone,\n{\n    x\n}\n";
+        assert_eq!(
+            signature_of(where_clause, Lang::Rust, "f").as_deref(),
+            Some("fn f<T>(x: T) -> T where T: Clone")
+        );
+        let python = "def handler(\n    request,\n    retries: int = 3,\n) -> int:\n    return 1\n";
+        assert_eq!(
+            signature_of(python, Lang::Python, "handler").as_deref(),
+            Some("def handler(request, retries: int = 3) -> int")
+        );
+        let go =
+            "package p\n\nfunc Serve(\n\taddr string,\n\tport int,\n) error {\n\treturn nil\n}\n";
+        assert_eq!(
+            signature_of(go, Lang::Go, "Serve").as_deref(),
+            Some("func Serve(addr string, port int) error")
+        );
+        let ts = "export async function load(\n  path: string,\n  opts: Options,\n): Promise<void> {\n}\n";
+        assert_eq!(
+            signature_of(ts, Lang::TypeScript, "load").as_deref(),
+            Some("export async function load(path: string, opts: Options): Promise<void>")
+        );
+        let commented =
+            "def handler(  # noqa: N802\n    request,  # the request\n) -> int:\n    return 1\n";
+        assert_eq!(
+            signature_of(commented, Lang::Python, "handler").as_deref(),
+            Some("def handler(request) -> int")
+        );
+        let java = "interface Store {\n  void save(\n      String key,\n      byte[] value);\n}\n";
+        assert_eq!(
+            signature_of(java, Lang::Java, "save").as_deref(),
+            Some("void save(String key, byte[] value)")
+        );
+    }
+
+    /// A wrapped signature longer than `MAX_SIGNATURE` keeps its
+    /// start and its end, with the return type. Whole, fastapi's
+    /// `APIRouter.get` printed 14,000 characters in every outline.
+    #[test]
+    fn a_very_long_signature_keeps_its_start_and_return_type() {
+        let mut params = String::new();
+        for i in 0..40 {
+            let _ = writeln!(params, "    argument_{i}: str = None,");
+        }
+        let python = format!("def handler(\n{params}) -> Response:\n    return 1\n");
+        let sig = signature_of(&python, Lang::Python, "handler").unwrap();
+        assert!(sig.len() <= super::MAX_SIGNATURE + 8, "{sig}");
+        assert!(
+            sig.starts_with("def handler(argument_0: str = None, "),
+            "{sig}"
+        );
+        assert!(sig.contains(" … "), "{sig}");
+        assert!(sig.ends_with("_39: str = None) -> Response"), "{sig}");
+    }
+
+    /// A signature that fits on its line reads as it did: to its brace,
+    /// or the whole line.
+    #[test]
+    fn a_one_line_signature_reads_as_before() {
+        assert_eq!(
+            signature_of("fn f(a: u8) -> u8 { a }\n", Lang::Rust, "f").as_deref(),
+            Some("fn f(a: u8) -> u8")
+        );
+        assert_eq!(
+            signature_of("def f(x):\n    return x\n", Lang::Python, "f").as_deref(),
+            Some("def f(x)")
+        );
+        assert_eq!(
+            signature_of("def f(x), do: x\n", Lang::Elixir, "f").as_deref(),
+            Some("def f(x)")
+        );
+    }
+}
+
+#[cfg(test)]
+mod outline_tree_tests {
     use super::get_outline_entries;
     use crate::lang::c::C_DEFINITIONS_FIXTURE;
     use crate::lang::cpp::CPP_DEFINITIONS_FIXTURE;
@@ -1574,7 +1940,7 @@ mod c_family_outline_tests {
 
     /// `(name, kind, start_line, end_line, children)` for an entry tree.
     #[derive(Debug, PartialEq)]
-    struct Node(String, OutlineKind, u32, u32, Vec<Node>);
+    struct Node(String, OutlineKind, u32, u32, Vec<Self>);
 
     fn tree(entries: Vec<OutlineEntry>) -> Vec<Node> {
         entries
@@ -1660,5 +2026,173 @@ mod c_family_outline_tests {
             tree(get_outline_entries(CPP_DEFINITIONS_FIXTURE, Lang::Cpp)),
             expected
         );
+    }
+
+    #[test]
+    fn ruby_outline_lists_classes_modules_and_methods() {
+        // #226: a class's instance methods and a module's `def self.`
+        // functions are entries, and a class inside a module collects its
+        // methods like a top-level class.
+        use OutlineKind::{Class, Function, Module};
+        let src = "module Shop
+  class Store
+    def save
+      1
+    end
+
+    def self.build
+      new
+    end
+  end
+end
+
+module Util
+  def self.slugify(s)
+    s
+  end
+
+  def self.titleize(s)
+    s
+  end
+end
+";
+        let expected = vec![
+            Node(
+                "Shop".into(),
+                Module,
+                1,
+                11,
+                vec![Node(
+                    "Store".into(),
+                    Class,
+                    2,
+                    10,
+                    vec![leaf("save", Function, 3, 5), leaf("build", Function, 7, 9)],
+                )],
+            ),
+            Node(
+                "Util".into(),
+                Module,
+                13,
+                21,
+                vec![
+                    leaf("slugify", Function, 14, 16),
+                    leaf("titleize", Function, 18, 20),
+                ],
+            ),
+        ];
+        assert_eq!(tree(get_outline_entries(src, Lang::Ruby)), expected);
+    }
+
+    #[test]
+    fn python_outline_lists_decorated_definitions_from_their_def_line() {
+        use OutlineKind::{Class, Function};
+        let src = "@decorator
+def top():
+    pass
+
+class Service:
+    @property
+    def prop(self):
+        pass
+
+    def plain(self):
+        pass
+
+@dataclass
+class Point:
+    @staticmethod
+    def origin():
+        pass
+";
+        let expected = vec![
+            leaf("top", Function, 2, 3),
+            Node(
+                "Service".into(),
+                Class,
+                5,
+                11,
+                vec![
+                    leaf("prop", Function, 7, 8),
+                    leaf("plain", Function, 10, 11),
+                ],
+            ),
+            Node(
+                "Point".into(),
+                Class,
+                14,
+                17,
+                vec![leaf("origin", Function, 16, 17)],
+            ),
+        ];
+        assert_eq!(tree(get_outline_entries(src, Lang::Python)), expected);
+    }
+
+    #[test]
+    fn typescript_outline_lists_abstract_classes_and_their_members() {
+        use OutlineKind::{Class, Function};
+        let src = "abstract class Shape {
+  abstract area(): number;
+  describe() {}
+}
+export abstract class Base {
+  run() {}
+}
+export default abstract class Fallback {}
+";
+        let expected = vec![
+            Node(
+                "Shape".into(),
+                Class,
+                1,
+                4,
+                vec![
+                    leaf("area", Function, 2, 2),
+                    leaf("describe", Function, 3, 3),
+                ],
+            ),
+            Node(
+                "Base".into(),
+                Class,
+                5,
+                7,
+                vec![leaf("run", Function, 6, 6)],
+            ),
+            leaf("Fallback", Class, 8, 8),
+        ];
+        for lang in [Lang::TypeScript, Lang::Tsx] {
+            assert_eq!(tree(get_outline_entries(src, lang)), expected, "{lang:?}");
+        }
+    }
+
+    /// `extern "C"` written before one function, with no braces, wraps that
+    /// function alone: the function is the entry, as with a block.
+    #[test]
+    fn an_extern_c_function_without_braces_is_an_entry() {
+        use OutlineKind::Function;
+        let src = "extern \"C\" int f(void) {\n  return 1;\n}\n\nint g(void) {\n  return 2;\n}\n";
+        let expected = vec![leaf("f", Function, 1, 3), leaf("g", Function, 5, 7)];
+        assert_eq!(tree(get_outline_entries(src, Lang::Cpp)), expected);
+    }
+
+    /// A Ruby class with no body has no children: its superclass is not an
+    /// anonymous class inside it.
+    #[test]
+    fn a_ruby_class_without_a_body_has_no_children() {
+        use OutlineKind::Class;
+        let src = "class X < Y; end\n\nclass Z < Y\nend\n";
+        let expected = vec![leaf("X", Class, 1, 1), leaf("Z", Class, 3, 4)];
+        assert_eq!(tree(get_outline_entries(src, Lang::Ruby)), expected);
+    }
+
+    /// A generator function is an outline function, as a plain one is.
+    #[test]
+    fn a_generator_function_is_an_entry() {
+        use OutlineKind::Function;
+        let src = "function* gen() {\n  yield 1;\n}\nexport function* more() {\n  yield 2;\n}\n";
+        let expected = vec![leaf("gen", Function, 1, 3), leaf("more", Function, 4, 6)];
+        for lang in [Lang::JavaScript, Lang::TypeScript] {
+            assert_eq!(tree(get_outline_entries(src, lang)), expected, "{lang:?}");
+        }
     }
 }

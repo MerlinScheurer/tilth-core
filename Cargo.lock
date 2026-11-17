@@ -591,12 +591,13 @@ dependencies = [
 
 [[package]]
 name = "tilth-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "dashmap",
  "fastbloom",
  "ignore",
  "memchr",
+ "rustix",
  "streaming-iterator",
  "tempfile",
  "thiserror",

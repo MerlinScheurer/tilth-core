@@ -10,12 +10,10 @@ use std::sync::{Arc, Mutex};
 use streaming_iterator::StreamingIterator;
 
 use crate::error::TilthError;
-use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
+use crate::lang::treesitter::is_bodiless_declaration;
+use crate::lang::{detect_file_type, detect_file_type_with_content};
 use crate::types::FileType;
-
-/// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
-pub const BATCH_EARLY_QUIT: usize = 50;
 
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
@@ -35,30 +33,124 @@ pub struct CallerMatch {
     pub content: Arc<String>,
 }
 
-/// Find all call sites of any symbol in `targets` across the codebase using a single walk.
-/// Returns tuples of (`target_name`, match) so callers know which symbol was matched.
-// The std hasher is part of the signature dependents pin; a generic hasher
-// would change it for every caller.
-#[allow(clippy::implicit_hasher)]
-pub fn find_callers_batch(
+/// What a caller walk returns: one `per_file` result for each file with a
+/// call site, in path order, and the code files it skipped for size although
+/// they contain a target, sorted.
+#[derive(Debug)]
+pub struct CallerWalk<T> {
+    pub per_file: Vec<T>,
+    pub skipped_large: Vec<PathBuf>,
+    /// The walk found at least `stop_after` call sites. It may have stopped
+    /// before visiting every file, so counts drawn from `per_file` are lower
+    /// bounds. Always false without `stop_after`.
+    pub reached_bound: bool,
+}
+
+/// Find every call site of any symbol in `targets` under `scope`, in one
+/// parallel walk that runs to the end unless `stop_after` is set.
+///
+/// `per_file` receives one file's call sites as (`target_name`, match)
+/// pairs in line order, and reduces them to what the caller keeps. It runs
+/// once per file that holds at least one call site. Its results come back
+/// sorted by file path, so the output does not depend on thread timing. A
+/// caller that needs exact totals counts inside `per_file` and keeps only
+/// the sites it will show; that is what bounds memory on a large tree.
+/// Code files over `MAX_FILE_SIZE` are not parsed; the ones whose text holds
+/// a target are listed in `skipped_large`, so a caller can say so.
+///
+/// `stop_after` is for callers that must stay fast on any tree and can say
+/// their count is a lower bound: the walk stops once it has found that many
+/// call sites, and `reached_bound` tells the caller so. Which files it
+/// reached first then depends on thread timing.
+#[expect(
+    clippy::implicit_hasher,
+    reason = "by design: the std hasher is part of the signature dependents pin; a generic one would change it for every caller"
+)]
+pub fn find_callers_batch<T, F>(
     targets: &HashSet<String>,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
-    early_quit_threshold: usize,
-) -> Result<Vec<(String, CallerMatch)>, TilthError> {
-    let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
-    let found_count = AtomicUsize::new(0);
+    stop_after: Option<usize>,
+    per_file: F,
+) -> Result<CallerWalk<T>, TilthError>
+where
+    T: Send,
+    F: Fn(Vec<(String, CallerMatch)>) -> T + Sync,
+{
+    let none = HashSet::new();
+    walk_callers(
+        targets,
+        &none,
+        scope,
+        bloom,
+        glob,
+        stop_after,
+        |sites, _| per_file(sites),
+    )
+}
+
+/// [`find_callers_batch`] that also reports, from the same parse, the types
+/// that define each of `owner_names` (each a subset of `targets`): `per_file`
+/// receives a file's call sites and its (name, owner) pairs, the owners a
+/// caller label would name for an owned definition with a body. A plain
+/// function adds no owner, and neither does a member declared without a body
+/// (a trait or interface method): a call through it runs an implementor's
+/// body, whose type is counted. `per_file` runs for each file with a call
+/// site or an owned definition.
+///
+/// A call site names a method without its type (`x.run()`), so a name that
+/// several types define cannot be traced to one of them by name alone; one
+/// walk tells both where the name is called and how many types define it.
+#[expect(
+    clippy::implicit_hasher,
+    reason = "by design: the std hasher is part of the signature, as in find_callers_batch"
+)]
+pub fn find_callers_and_owners<T, F>(
+    targets: &HashSet<String>,
+    owner_names: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+    per_file: F,
+) -> Result<CallerWalk<T>, TilthError>
+where
+    T: Send,
+    F: Fn(Vec<(String, CallerMatch)>, Vec<(String, String)>) -> T + Sync,
+{
+    walk_callers(targets, owner_names, scope, bloom, glob, None, per_file)
+}
+
+fn walk_callers<T, F>(
+    targets: &HashSet<String>,
+    owner_names: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+    stop_after: Option<usize>,
+    per_file: F,
+) -> Result<CallerWalk<T>, TilthError>
+where
+    T: Send,
+    F: Fn(Vec<(String, CallerMatch)>, Vec<(String, String)>) -> T + Sync,
+{
+    let found: Mutex<Vec<(PathBuf, T)>> = Mutex::new(Vec::new());
+    let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let sites_found = AtomicUsize::new(0);
+    let reached = |n: usize| stop_after.is_some_and(|bound| n >= bound);
 
     let walker = super::walk::walker(scope, glob)?;
+    let words: Vec<&str> = targets.iter().map(String::as_str).collect();
 
     walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
+        let found = &found;
+        let skipped_large = &skipped_large;
+        let words = &words;
+        let sites_found = &sites_found;
+        let per_file = &per_file;
 
         Box::new(move |entry| {
-            // Early termination: enough callers found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
+            if reached(sites_found.load(Ordering::Relaxed)) {
                 return ignore::WalkState::Quit;
             }
 
@@ -72,12 +164,20 @@ pub fn find_callers_batch(
 
             let path = entry.path();
 
+            if oversized_code_holding(path, words) {
+                skipped_large
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(path.to_path_buf());
+                return ignore::WalkState::Continue;
+            }
+
             // Read + size-gate + bloom prefilter in one shared step.
             let Some((content, _mtime)) = super::bloom_walk::read_with_bloom_check(
                 path,
                 targets,
                 bloom,
-                super::bloom_walk::MAX_FILE_SIZE,
+                crate::source::MAX_FILE_SIZE,
             ) else {
                 return ignore::WalkState::Continue;
             };
@@ -92,7 +192,7 @@ pub fn find_callers_batch(
             }
 
             // Only process files with tree-sitter grammars
-            let file_type = detect_file_type(path);
+            let file_type = detect_file_type_with_content(path, &content);
             let FileType::Code(lang) = file_type else {
                 return ignore::WalkState::Continue;
             };
@@ -101,52 +201,136 @@ pub fn find_callers_batch(
                 return ignore::WalkState::Continue;
             };
 
-            let file_callers =
-                find_callers_treesitter_batch(path, scope, targets, &ts_lang, &content, lang);
+            let (mut file_callers, owners) = find_callers_treesitter_batch(
+                path,
+                scope,
+                targets,
+                owner_names,
+                &ts_lang,
+                &content,
+                lang,
+            );
 
-            if !file_callers.is_empty() {
-                found_count.fetch_add(file_callers.len(), Ordering::Relaxed);
-                let mut all = matches
+            if !file_callers.is_empty() || !owners.is_empty() {
+                // Stable, so two calls on one line keep the query's order.
+                file_callers.sort_by_key(|(_, m)| m.line);
+                sites_found.fetch_add(file_callers.len(), Ordering::Relaxed);
+                let kept = per_file(file_callers, owners);
+                found
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_callers);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((path.to_path_buf(), kept));
             }
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
+    let mut found = found
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    found.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut skipped_large = skipped_large
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    skipped_large.sort();
+    Ok(CallerWalk {
+        per_file: found.into_iter().map(|(_, kept)| kept).collect(),
+        skipped_large,
+        reached_bound: reached(sites_found.into_inner()),
+    })
 }
 
-/// Tree-sitter call site detection for a set of target symbols.
-/// Returns tuples of (`matched_target_name`, `CallerMatch`).
+/// The (name, owner) pair of each owned definition with a body of one of
+/// `names` in a parsed file.
+fn owners_in_tree(
+    tree: &tree_sitter::Tree,
+    lines: &[&str],
+    names: &HashSet<String>,
+    lang: crate::types::Lang,
+) -> Vec<(String, String)> {
+    let mut owners = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if let Some(name) = super::scope::definition_name(node, lines, lang) {
+            if names.contains(&name) && !is_bodiless_declaration(node) {
+                if let Some(owner) = super::scope::definition_owner(node, lines, lang) {
+                    owners.push((name, owner));
+                }
+            }
+        }
+        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        let mut done = true;
+        while cursor.goto_parent() {
+            if cursor.goto_next_sibling() {
+                done = false;
+                break;
+            }
+        }
+        if done {
+            return owners;
+        }
+    }
+}
+
+/// Is `path` a code file the walk would parse, over the size cap, whose text
+/// mentions one of `words` as a whole identifier? `renew` is no call of
+/// `new`. The check streams the file, so any size costs a few chunks.
+#[must_use]
+pub fn oversized_code_holding(path: &Path, words: &[&str]) -> bool {
+    let too_big = std::fs::metadata(path).is_ok_and(|m| m.len() > crate::source::MAX_FILE_SIZE);
+    if !too_big {
+        return false;
+    }
+    let FileType::Code(lang) = detect_file_type(path) else {
+        return false;
+    };
+    outline_language(lang).is_some() && crate::source::file_mentions(path, words)
+}
+
+/// Tree-sitter call site detection for a set of target symbols, from one
+/// parse that also yields the owners of `owner_names` (see
+/// [`find_callers_and_owners`]). Returns tuples of (`matched_target_name`,
+/// `CallerMatch`), and (name, owner) pairs.
+type FileSites = (Vec<(String, CallerMatch)>, Vec<(String, String)>);
+
 fn find_callers_treesitter_batch(
     path: &Path,
     scope: &Path,
     targets: &HashSet<String>,
+    owner_names: &HashSet<String>,
     ts_lang: &tree_sitter::Language,
     content: &str,
     lang: crate::types::Lang,
-) -> Vec<(String, CallerMatch)> {
-    // Get the query string for this language
-    let Some(query_str) = super::callee_query::callee_query_str(lang) else {
-        return Vec::new();
-    };
-
+) -> FileSites {
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     let content_bytes = content.as_bytes();
     let lines: Vec<&str> = content.lines().collect();
+
+    let owners = if owner_names
+        .iter()
+        .any(|n| memchr::memmem::find(content_bytes, n.as_bytes()).is_some())
+    {
+        owners_in_tree(&tree, &lines, owner_names, lang)
+    } else {
+        Vec::new()
+    };
+
+    // Get the query string for this language
+    let Some(query_str) = super::callee_query::callee_query_str(lang) else {
+        return (Vec::new(), owners);
+    };
 
     // One Arc per file — all call sites share the same allocation.
     let shared_content: Arc<String> = Arc::new(content.to_string());
@@ -227,10 +411,10 @@ fn find_callers_treesitter_batch(
 
         callers
     }) else {
-        return Vec::new();
+        return (Vec::new(), owners);
     };
 
-    callers
+    (callers, owners)
 }
 
 /// Walk up the AST from a node to find the enclosing function definition.
@@ -249,6 +433,34 @@ fn find_enclosing_function(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeSet, HashMap};
+
+    /// Each name maps to the types whose definitions of it a caller label
+    /// would name. A plain function of the same name adds no type, and
+    /// neither does a trait method declared without a body.
+    #[test]
+    fn the_caller_walk_lists_the_types_that_define_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.rs"),
+            "struct A;\nstruct B;\nimpl A { fn new() -> A { A } }\n\
+             impl B { fn new() -> B { B } fn only() {} }\nfn new() {}\nfn free() {}\n\
+             trait Run { fn only(&self); }\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let names: HashSet<String> = ["new", "only", "free"].map(String::from).into();
+        let walk =
+            find_callers_and_owners(&names, &names, dir.path(), &bloom, None, |_, o| o).unwrap();
+        let mut owners: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (name, owner) in walk.per_file.into_iter().flatten() {
+            owners.entry(name).or_default().insert(owner);
+        }
+        let of = |n: &str| owners.get(n).map(|o| o.iter().cloned().collect::<Vec<_>>());
+        assert_eq!(of("new"), Some(vec!["A".to_string(), "B".to_string()]));
+        assert_eq!(of("only"), Some(vec!["B".to_string()]));
+        assert_eq!(of("free"), None);
+    }
 
     /// The bloom pre-filter must never hide a file that holds a call site. A
     /// quote inside a triple-quoted string, or an apostrophe in a `#` comment,
@@ -272,13 +484,192 @@ mod tests {
 
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let targets: HashSet<String> = std::iter::once("helper_after".to_string()).collect();
-        let found =
-            find_callers_batch(&targets, dir.path(), &bloom, None, BATCH_EARLY_QUIT).unwrap();
-        let mut callers: Vec<&str> = found
+        let found = find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| {
+            sites
+                .into_iter()
+                .map(|(_, m)| m.calling_function)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+        let callers: Vec<&str> = found
+            .per_file
             .iter()
-            .map(|(_, m)| m.calling_function.as_str())
+            .flatten()
+            .map(String::as_str)
             .collect();
-        callers.sort_unstable();
         assert_eq!(callers, ["comment_caller", "docstring_caller"]);
+    }
+
+    /// Each `(line, label)` of the call sites of `target` in `file`.
+    fn caller_labels(file: &str, source: &str, target: &str) -> Vec<(u32, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(file), source).unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once(target.to_string()).collect();
+        let found = find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| {
+            sites
+                .into_iter()
+                .map(|(_, m)| (m.line, m.calling_function))
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+        let mut labels: Vec<(u32, String)> = found.per_file.into_iter().flatten().collect();
+        labels.sort();
+        labels
+    }
+
+    fn labels(pairs: &[(u32, &str)]) -> Vec<(u32, String)> {
+        pairs.iter().map(|&(l, s)| (l, s.to_string())).collect()
+    }
+
+    /// A call in a local variable's initializer is made by the function that
+    /// declares the variable, so it carries that function's name. A
+    /// top-level binding has no function around it and keeps its own name.
+    #[test]
+    fn a_call_in_a_local_initializer_is_labelled_by_its_function() {
+        let ts = "function target() { return 1; }\n\
+                  function outer() {\n\
+                  \x20 const result = target();\n\
+                  \x20 let other = target(), more = 2;\n\
+                  \x20 var legacy = target();\n\
+                  \x20 function nested() { const result = target(); return result; }\n\
+                  }\n\
+                  class Service {\n\
+                  \x20 run() { const result = target(); return result; }\n\
+                  }\n\
+                  function* generate() { const value = target(); yield value; }\n\
+                  const topLevel = target();\n";
+        assert_eq!(
+            caller_labels("calls.ts", ts, "target"),
+            labels(&[
+                (3, "outer"),
+                (4, "outer"),
+                (5, "outer"),
+                (6, "nested"),
+                (9, "Service.run"),
+                (11, "generate"),
+                (12, "topLevel"),
+            ])
+        );
+
+        let rust = "fn rust_target() -> u32 { 1 }\n\
+                    fn rust_outer() -> u32 {\n\
+                    \x20   const LOCAL: u32 = rust_target();\n\
+                    \x20   static S: u32 = rust_target();\n\
+                    \x20   LOCAL + S\n\
+                    }\n\
+                    const TOP: u32 = rust_target();\n";
+        assert_eq!(
+            caller_labels("lib.rs", rust, "rust_target"),
+            labels(&[(3, "rust_outer"), (4, "rust_outer"), (7, "TOP")])
+        );
+
+        // A function value is labelled by its own name or the name it is
+        // bound to; an anonymous callback belongs to what is around it.
+        let js = "res.send = function send(body) {\n\
+                    var file = target(body);\n\
+                  };\n\
+                  app.handle = function (req) {\n\
+                    const out = target(req);\n\
+                  };\n\
+                  function outer() {\n\
+                    const cb = () => target();\n\
+                    [1].map(function () { const v = target(); });\n\
+                  }\n\
+                  const api = { load: function () { const v = target(); } };\n\
+                  describe('x', () => { const app = target(); });\n";
+        assert_eq!(
+            caller_labels("lib.js", js, "target"),
+            labels(&[
+                (2, "send"),
+                (5, "handle"),
+                (8, "cb"),
+                (9, "outer"),
+                (11, "load"),
+                (12, "<top-level>"),
+            ])
+        );
+
+        let bash = "target() { echo hi; }\nouter() {\n  value=$(target)\n  echo \"$value\"\n}\n";
+        assert_eq!(
+            caller_labels("run.sh", bash, "target"),
+            labels(&[(3, "outer")])
+        );
+    }
+
+    /// A method's label names the type it belongs to, however the language
+    /// attaches it: a Rust `impl` block, a Go receiver, or a C++ definition
+    /// outside its class.
+    #[test]
+    fn a_method_label_names_its_type() {
+        let rust = "struct A;\nimpl A {\n    fn run(&self) { go(); }\n}\n\
+                    impl<T> Wrap<T> {\n    fn run(&self) { go(); }\n}\n";
+        assert_eq!(
+            caller_labels("m.rs", rust, "go"),
+            labels(&[(3, "A.run"), (6, "Wrap.run")])
+        );
+
+        let go = "package p\n\ntype Context struct{}\n\n\
+                  func (c *Context) reset() { work() }\n\n\
+                  func (r JSON) Render() error { work(); return nil }\n";
+        assert_eq!(
+            caller_labels("ctx.go", go, "work"),
+            labels(&[(5, "Context.reset"), (7, "JSON.Render")])
+        );
+
+        let cpp = "struct B { int run(); };\nint B::run() { return go(); }\n";
+        assert_eq!(caller_labels("b.cpp", cpp, "go"), labels(&[(2, "B.run")]));
+    }
+
+    /// A file skipped for size is listed only when it names a target as a
+    /// whole word: `renew` holds the text `new`, but no call of `new`.
+    #[test]
+    fn a_big_file_is_listed_only_when_it_names_a_target_as_a_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(crate::source::MAX_FILE_SIZE).unwrap();
+        let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        std::fs::write(
+            dir.path().join("word.rs"),
+            format!("{pad}fn a() {{ new(); }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("part.rs"),
+            format!("{pad}fn b() {{ renew(); }}\n"),
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once("new".to_string()).collect();
+        let walk =
+            find_callers_batch(&targets, dir.path(), &bloom, None, None, |s| s.len()).unwrap();
+        let names: Vec<_> = walk
+            .skipped_large
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["word.rs"]);
+    }
+
+    /// `reached_bound` is set exactly when the walk found `stop_after` sites,
+    /// so a caller labels a count a lower bound only when it may be one.
+    #[test]
+    fn reached_bound_says_whether_the_walk_found_stop_after_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn a() {\n    go();\n    go();\n}\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once("go".to_string()).collect();
+        let walk = |stop_after| {
+            find_callers_batch(&targets, dir.path(), &bloom, None, stop_after, |s| s.len()).unwrap()
+        };
+
+        let unbounded = walk(None);
+        assert_eq!(unbounded.per_file, [2]);
+        assert!(!unbounded.reached_bound);
+        assert!(!walk(Some(3)).reached_bound, "2 sites under a bound of 3");
+        assert!(walk(Some(2)).reached_bound, "2 sites reach a bound of 2");
     }
 }

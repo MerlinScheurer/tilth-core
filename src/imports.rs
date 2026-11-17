@@ -1,17 +1,15 @@
 //! Imports as data, one per module a statement names, and their resolution
 //! to local file paths (the MCP layer's related-file hint, deps, callees).
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use streaming_iterator::StreamingIterator;
 
-use crate::lang::detect_file_type;
+use crate::lang::detect_file_type_with_content;
 use crate::types::{FileType, Lang};
-
-const MAX_SUGGESTIONS: usize = 8;
 
 /// The local files a code file's imports resolve to, read through `cache`'s
 /// parsed tree so an outlined read does not parse the file a second time.
@@ -19,13 +17,18 @@ const MAX_SUGGESTIONS: usize = 8;
 /// imports are external.
 #[must_use]
 pub fn resolve_related_files(file_path: &Path, cache: &crate::cache::OutlineCache) -> Vec<PathBuf> {
+    // The path alone says whether a file is code, so a log or data file of
+    // any size is never read just to find it names no imports.
+    if !matches!(crate::lang::detect_file_type(file_path), FileType::Code(_)) {
+        return Vec::new();
+    }
     if let Some(parsed) = cache.get_or_parse(file_path) {
         let imports = imports_in_tree(parsed.tree.root_node(), &parsed.content, parsed.lang);
         return resolve_imports(file_path, parsed.lang, &imports);
     }
     // The cache holds no tree for this file (no grammar, or over its size
     // cap): read it and parse here.
-    let Ok(content) = fs::read_to_string(file_path) else {
+    let Ok(content) = crate::source::read_source(file_path) else {
         return Vec::new();
     };
     resolve_related_files_with_content(file_path, &content)
@@ -34,36 +37,68 @@ pub fn resolve_related_files(file_path: &Path, cache: &crate::cache::OutlineCach
 /// Same as `resolve_related_files` but takes pre-read content to avoid a redundant file read.
 #[must_use]
 pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Vec<PathBuf> {
-    let FileType::Code(lang) = detect_file_type(file_path) else {
+    let FileType::Code(lang) = detect_file_type_with_content(file_path, content) else {
         return Vec::new();
     };
     resolve_imports(file_path, lang, &extract_imports(content, lang))
 }
 
 /// Resolve the local imports of the file at `file_path` to existing files,
-/// first come first served, at most `MAX_SUGGESTIONS`. For a caller that
-/// already holds the file's imports.
+/// each once, in import order. For a caller that already holds the file's
+/// imports.
 #[must_use]
 pub fn resolve_imports(file_path: &Path, lang: Lang, imports: &[Import]) -> Vec<PathBuf> {
-    let Some(dir) = file_path.parent() else {
-        return Vec::new();
-    };
-
     let mut results = Vec::new();
     for import in imports {
-        if results.len() >= MAX_SUGGESTIONS {
-            break;
-        }
-        if is_external(&import.source, lang) {
-            continue;
-        }
-        if let Some(path) = resolve(dir, &import.source, lang) {
+        for path in resolve_import(file_path, lang, import) {
             if !results.contains(&path) {
                 results.push(path);
             }
         }
     }
     results
+}
+
+/// The local files one import of the file at `file_path` names, empty when
+/// it names none. A Python absolute import (`from pkg.mod import x`) is
+/// local when `pkg/mod.py` sits where Python would look for it (see
+/// `resolve_python_absolute`); `is_external` cannot tell that without the
+/// disk. `from pkg import a, b` names the submodule `pkg/a.py` when there is
+/// one, and `pkg` itself for a name that is no submodule.
+#[must_use]
+pub fn resolve_import(file_path: &Path, lang: Lang, import: &Import) -> Vec<PathBuf> {
+    let Some(dir) = file_path.parent() else {
+        return Vec::new();
+    };
+    if is_external(&import.source, lang) && lang != Lang::Python {
+        return Vec::new();
+    }
+    if import.names.is_empty() {
+        return resolve(dir, &import.source, lang).into_iter().collect();
+    }
+    let mut files = Vec::new();
+    let mut names_the_module = false;
+    for name in &import.names {
+        // `from . import x` names `.x`; `from pkg import x` names `pkg.x`.
+        let submodule = if import.source.ends_with('.') {
+            format!("{}{name}", import.source)
+        } else {
+            format!("{}.{name}", import.source)
+        };
+        match resolve(dir, &submodule, lang) {
+            Some(file) if !files.contains(&file) => files.push(file),
+            Some(_) => {}
+            None => names_the_module = true,
+        }
+    }
+    if names_the_module {
+        if let Some(file) = resolve(dir, &import.source, lang) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+    files
 }
 
 /// One module an import statement names.
@@ -84,13 +119,19 @@ pub struct Import {
     pub start_line: u32,
     /// The 1-based last line of the statement, inclusive.
     pub end_line: u32,
+    /// What a Python `from m import a, b` takes from `m`: `a` and `b`, each
+    /// a name in `m` or a submodule of it. Empty for every other import, and
+    /// for `from m import *`.
+    pub names: Vec<String>,
 }
 
 /// Every module `content` imports, one [`Import`] per module, in source order.
 ///
-/// In Go, Rust, Python, JavaScript, TypeScript, Scala, Elixir, Java and
-/// Kotlin, statements come from the syntax tree, so an import-shaped line
-/// inside a string is not one and an alias is not part of a source. In C,
+/// In Go, Rust, Python, JavaScript, TypeScript, Scala, Elixir, Java,
+/// Kotlin, PHP, C# and Swift, statements come from the syntax tree, so an
+/// import-shaped line inside a string is not one and an alias is not part
+/// of a source. A JavaScript or TypeScript re-export (`export … from "m"`)
+/// imports `m` too. In C,
 /// C++ and Bash, where an import is one line naming one file, each line
 /// `is_import_line` accepts gives one import, its source read by
 /// `extract_import_source`. A statement that does not spell its module
@@ -142,11 +183,17 @@ pub fn imports_in_tree(root: tree_sitter::Node, content: &str, lang: Lang) -> Ve
                 if source.is_empty() {
                     continue;
                 }
+                let names = if lang == Lang::Python && node.kind() == "import_from_statement" {
+                    python_from_names(node, content)
+                } else {
+                    Vec::new()
+                };
                 out.push(Import {
                     source,
                     line,
                     start_line: line_of(node),
                     end_line: last_line_of(node),
+                    names,
                 });
             }
         }
@@ -165,29 +212,34 @@ fn statement_query(lang: Lang) -> Option<&'static tree_sitter::Query> {
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     let pattern = match lang {
-        Lang::Go | Lang::Scala | Lang::Java => "(import_declaration) @statement",
+        Lang::Go | Lang::Scala | Lang::Java | Lang::Swift => "(import_declaration) @statement",
         Lang::Rust => "(use_declaration) @statement",
         Lang::Python => {
             "[(import_statement) (import_from_statement) (future_import_statement)] @statement"
         }
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => "(import_statement) @statement",
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
+            "[(import_statement) (export_statement source: (_))] @statement"
+        }
         Lang::Elixir => "(call target: (identifier)) @statement",
         Lang::Kotlin => "(import) @statement",
+        Lang::Php => "(namespace_use_declaration) @statement",
+        Lang::CSharp => "(using_directive) @statement",
         _ => return None,
     };
     let mut compiled = COMPILED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&query) = compiled.get(&lang) {
-        return Some(query);
+    match compiled.entry(lang) {
+        Entry::Occupied(e) => Some(*e.get()),
+        Entry::Vacant(e) => {
+            let language = crate::lang::outline::outline_language(lang)?;
+            // One query per language at most, so leaking it to get a
+            // `'static` borrow is bounded, and matching then runs without
+            // the lock.
+            let query = Box::leak(Box::new(tree_sitter::Query::new(&language, pattern).ok()?));
+            Some(*e.insert(query))
+        }
     }
-    let language = crate::lang::outline::outline_language(lang)?;
-    // One query per language at most, so leaking it to get a `'static`
-    // borrow is bounded, and matching then runs without the lock.
-    let query: &'static tree_sitter::Query =
-        Box::leak(Box::new(tree_sitter::Query::new(&language, pattern).ok()?));
-    compiled.insert(lang, query);
-    Some(query)
 }
 
 /// Languages whose import statements are read from the syntax tree: one
@@ -206,6 +258,9 @@ fn reads_statements_from_tree(lang: Lang) -> bool {
             | Lang::Elixir
             | Lang::Java
             | Lang::Kotlin
+            | Lang::Php
+            | Lang::CSharp
+            | Lang::Swift
     )
 }
 
@@ -226,6 +281,7 @@ fn line_imports(content: &str, lang: Lang) -> Vec<Import> {
             line,
             start_line: line,
             end_line: line,
+            names: Vec::new(),
         });
     }
     out
@@ -258,6 +314,13 @@ fn statement_modules(node: tree_sitter::Node, src: &str, lang: Lang) -> Option<V
         (Lang::Python, "future_import_statement") => {
             out.push(("__future__".to_string(), line_of(node)));
         }
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "export_statement") => {
+            // Only a re-export names a module: `export { x } from "m"`,
+            // `export * from "m"`, `export * as ns from "m"`.
+            if let Some(source) = node.child_by_field_name("source") {
+                out.push((unquote(source, src), line_of(source)));
+            }
+        }
         (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "import_statement") => {
             // `import x from "m"` and `import "m"` carry the source on the
             // statement; `import x = require("m")` on its require clause.
@@ -277,9 +340,28 @@ fn statement_modules(node: tree_sitter::Node, src: &str, lang: Lang) -> Option<V
             dotted_import(node, src, &mut out);
         }
         (Lang::Elixir, "call") => elixir_directive(node, src, &mut out)?,
+        (Lang::Php, "namespace_use_declaration") => php_use(node, src, &mut out),
+        (Lang::CSharp, "using_directive") => csharp_using(node, src, &mut out),
+        (Lang::Swift, "import_declaration") => {
+            let mut cursor = node.walk();
+            let path = node
+                .named_children(&mut cursor)
+                .find(|c| c.kind() == "identifier");
+            if let Some(path) = path {
+                out.push((compact(path, src), line_of(path)));
+            }
+        }
         _ => return None,
     }
     Some(out)
+}
+
+/// The names a Python `from m import a, b as c` takes from `m`: `a`, `b`.
+fn python_from_names(node: tree_sitter::Node, src: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.children_by_field_name("name", &mut cursor)
+        .map(|name| compact(name.child_by_field_name("name").unwrap_or(name), src))
+        .collect()
 }
 
 /// Go: `import "m"` and `import ( "a"; x "b" )`, one module per spec.
@@ -454,6 +536,61 @@ fn elixir_directive(
         _ => out.push((compact(first, src), line_of(first))),
     }
     Some(())
+}
+
+/// PHP: `use A\B;`, `use A\B as C, D\E;` and the group `use A\{B, C as D};`,
+/// one module per clause, its alias left out. A group's members sit under
+/// its prefix. `use function` and `use const` import a function or a
+/// constant by its qualified name, which is read the same way.
+fn php_use(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
+    fn clause_name(clause: tree_sitter::Node) -> Option<tree_sitter::Node> {
+        let mut cursor = clause.walk();
+        let found = clause
+            .named_children(&mut cursor)
+            .find(|c| matches!(c.kind(), "qualified_name" | "name"));
+        // `use A\B as C`: the alias is a `name` too, after the module.
+        found.filter(|n| clause.child_by_field_name("alias") != Some(*n))
+    }
+
+    let prefix = {
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .find(|c| c.kind() == "namespace_name");
+        found.map(|p| compact(p, src))
+    };
+    // A group's clauses sit in its body; plain clauses on the statement.
+    let holder = node.child_by_field_name("body").unwrap_or(node);
+    let mut cursor = holder.walk();
+    let clauses: Vec<tree_sitter::Node> = holder.named_children(&mut cursor).collect();
+    for clause in clauses {
+        if clause.kind() != "namespace_use_clause" {
+            continue;
+        }
+        let Some(name) = clause_name(clause) else {
+            continue;
+        };
+        let name = compact(name, src);
+        let name = name.trim_start_matches('\\');
+        let source = prefix.as_deref().map_or_else(
+            || name.to_string(),
+            |prefix| join_path(prefix.trim_start_matches('\\'), name, "\\"),
+        );
+        out.push((source, line_of(clause)));
+    }
+}
+
+/// C#: `using A.B;`, `using static A.B;` and the alias `using X = A.B;`
+/// name the namespace or type `A.B`.
+fn csharp_using(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
+    let alias = node.child_by_field_name("name");
+    let mut cursor = node.walk();
+    let target = node
+        .named_children(&mut cursor)
+        .find(|c| Some(*c) != alias && !c.kind().ends_with("comment"));
+    if let Some(target) = target {
+        out.push((compact(target, src), line_of(target)));
+    }
 }
 
 fn text<'a>(node: tree_sitter::Node, src: &'a str) -> &'a str {
@@ -662,7 +799,7 @@ fn resolve_js(dir: &Path, source: &str) -> Option<PathBuf> {
 fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
     let dots = source.bytes().take_while(|&b| b == b'.').count();
     if dots == 0 {
-        return None;
+        return resolve_python_absolute(dir, source);
     }
     // Each dot beyond the first goes up one directory.
     let mut base = dir.to_path_buf();
@@ -685,6 +822,55 @@ fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
         return Some(as_pkg);
     }
     None
+}
+
+/// `a.b.c` as Python finds it from a file in `dir`: `a/b/c.py` or
+/// `a/b/c/__init__.py` under a directory on Python's path, or under that
+/// directory's `src/` (the src layout). Python 3 puts a script's own
+/// directory on its path, and for a module in a package the directory
+/// above its top package; the directory of a package is never on it, so a
+/// `json.py` inside a package does not hide the standard library's `json`.
+/// When a project root is marked (`.git`, `pyproject.toml`, `setup.py` or
+/// `setup.cfg`), every directory from `dir` up to it that is not a package
+/// is searched, nearest first, as running a test or script from the root
+/// puts them on the path. Without one, only the nearest such directory is.
+fn resolve_python_absolute(dir: &Path, source: &str) -> Option<PathBuf> {
+    const ROOT_MARKERS: [&str; 4] = [".git", "pyproject.toml", "setup.py", "setup.cfg"];
+    let first = source.split('.').next().filter(|p| !p.is_empty())?;
+    let rel: PathBuf = source.split('.').collect();
+    let root = dir
+        .ancestors()
+        .find(|a| ROOT_MARKERS.iter().any(|m| a.join(m).exists()));
+    // The directories on the path, nearest first.
+    let mut on_path = Vec::new();
+    for ancestor in dir.ancestors() {
+        let at_root = Some(ancestor) == root;
+        if at_root || !ancestor.join("__init__.py").is_file() {
+            on_path.push(ancestor);
+            if root.is_none() {
+                break;
+            }
+        }
+        if at_root {
+            break;
+        }
+    }
+    on_path
+        .into_iter()
+        .flat_map(|dir| [dir.to_path_buf(), dir.join("src")])
+        .find_map(|base| {
+            // One stat rules out most bases: the top-level package or module.
+            let top = base.join(first);
+            if !top.is_dir() && !top.with_extension("py").is_file() {
+                return None;
+            }
+            let as_file = base.join(&rel).with_extension("py");
+            if as_file.is_file() {
+                return Some(as_file);
+            }
+            let as_pkg = base.join(&rel).join("__init__.py");
+            as_pkg.is_file().then_some(as_pkg)
+        })
 }
 
 // --- C/C++ ---
@@ -712,9 +898,33 @@ fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
     use std::fs;
+
+    /// A pipe names no imports, and looking for them never blocks on one
+    /// that has no writer, whether its name says code or not.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_never_blocks_the_imports_lookup() {
+        use crate::test_readers::{make_pipe, unless_blocked_on};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["main.rs", "server.log"] {
+            let pipe = dir.path().join(name);
+            make_pipe(&pipe);
+            let cache = crate::cache::OutlineCache::new();
+            let related = unless_blocked_on(&pipe, || resolve_related_files(&pipe, &cache));
+            assert_eq!(
+                related.expect("the imports lookup blocked on a pipe"),
+                Vec::<PathBuf>::new(),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn every_tree_read_language_has_a_compiled_statement_query() {
@@ -729,10 +939,102 @@ mod tests {
             Lang::Elixir,
             Lang::Java,
             Lang::Kotlin,
+            Lang::Php,
+            Lang::CSharp,
+            Lang::Swift,
         ] {
             assert!(reads_statements_from_tree(lang), "{lang:?}");
             assert!(statement_query(lang).is_some(), "{lang:?}");
         }
+    }
+
+    /// The files `rel` (a Python file under `root`) imports, relative to
+    /// `root`.
+    fn python_related(root: &Path, rel: &str) -> Vec<String> {
+        let file = root.join(rel);
+        let content = fs::read_to_string(&file).unwrap();
+        resolve_related_files_with_content(&file, &content)
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().display().to_string())
+            .collect()
+    }
+
+    fn write_tree(root: &Path, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+    }
+
+    /// `from pkg import mod` imports the submodule `pkg/mod.py` when there
+    /// is one, and a name from `pkg/__init__.py` otherwise.
+    #[test]
+    fn python_from_import_resolves_submodules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_tree(
+            &root,
+            &[
+                ("pyproject.toml", ""),
+                ("pkg/__init__.py", ""),
+                ("pkg/other.py", ""),
+                ("pkg/sub/__init__.py", "def helper():\n    pass\n"),
+                ("pkg/sub/mod.py", ""),
+                ("pkg/a.py", "from pkg.sub import mod\nfrom . import other\n"),
+                (
+                    "pkg/b.py",
+                    "from pkg.sub import (\n    mod as m,\n    helper,\n)\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            python_related(&root, "pkg/a.py"),
+            ["pkg/sub/mod.py", "pkg/other.py"]
+        );
+        assert_eq!(
+            python_related(&root, "pkg/b.py"),
+            ["pkg/sub/mod.py", "pkg/sub/__init__.py"]
+        );
+    }
+
+    /// Python 3 puts a script's directory on the path, and for a module in
+    /// a package the directory above its top package; a package's own
+    /// directory is never on it. So `import json` in a package module is the
+    /// standard library even beside a `json.py`, while a script imports its
+    /// neighbour. Without a project root, the search stops there instead of
+    /// climbing to `/`.
+    #[test]
+    fn python_absolute_imports_search_where_python_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_tree(
+            &root,
+            &[
+                ("proj/pyproject.toml", ""),
+                ("proj/pkg/__init__.py", ""),
+                ("proj/pkg/json.py", ""),
+                ("proj/pkg/util.py", ""),
+                ("proj/pkg/a.py", "import json\nimport pkg.util\n"),
+                ("proj/scripts/helper.py", ""),
+                ("proj/scripts/run.py", "import helper\nimport json\n"),
+                ("loose/util.py", ""),
+                ("loose/inner/pkg2/__init__.py", ""),
+                ("loose/inner/pkg2/a.py", "import util\nimport pkg2\n"),
+            ],
+        );
+        assert_eq!(
+            python_related(&root.join("proj"), "pkg/a.py"),
+            ["pkg/util.py"]
+        );
+        assert_eq!(
+            python_related(&root.join("proj"), "scripts/run.py"),
+            ["scripts/helper.py"]
+        );
+        assert_eq!(
+            python_related(&root.join("loose"), "inner/pkg2/a.py"),
+            ["inner/pkg2/__init__.py"]
+        );
     }
 
     fn sources(content: &str, lang: Lang) -> Vec<String> {
@@ -799,6 +1101,57 @@ mod tests {
         let content = "import {\n  first,\n  second,\n} from \"./util\";\n";
         let related = resolve_related_files_with_content(&tmp.path().join("main.ts"), content);
         assert_eq!(related, [tmp.path().join("util.ts")]);
+    }
+
+    /// PHP, C# and Swift statements come from the tree: a PHP group names
+    /// each member under its prefix, and no alias is part of a source. Read
+    /// off the line, the group was `App\\Models\\` and the alias stayed on.
+    #[test]
+    fn php_csharp_and_swift_imports_name_each_module_without_aliases() {
+        let php = "<?php\nuse App\\Models\\{User, Post as P};\nuse Foo\\Bar as Baz, Qux;\nuse function Foo\\helper;\n$s = 'use Not\\Real;';\nclass A {}\n";
+        assert_eq!(
+            sources(php, Lang::Php),
+            [
+                "App\\Models\\User",
+                "App\\Models\\Post",
+                "Foo\\Bar",
+                "Qux",
+                "Foo\\helper"
+            ]
+        );
+        let csharp = "using System;\nusing Json = Newtonsoft.Json;\nusing static System.Math;\nnamespace N {\n  using Inner.Thing;\n  class A {}\n}\n";
+        assert_eq!(
+            sources(csharp, Lang::CSharp),
+            ["System", "Newtonsoft.Json", "System.Math", "Inner.Thing"]
+        );
+        let swift =
+            "import Foundation\nimport struct Foo.Bar\n@testable import MyApp\nclass A {}\n";
+        assert_eq!(
+            sources(swift, Lang::Swift),
+            ["Foundation", "Foo.Bar", "MyApp"]
+        );
+    }
+
+    /// A re-export imports the module it names. Matching only `import`, a
+    /// barrel that re-exports had no imports at all.
+    #[test]
+    fn js_re_exports_are_imports() {
+        let ts = "export { y } from \"./y\";\nexport * from './all';\nexport * as ns from \"./ns\";\nimport { z } from \"./z\";\nexport { local };\nexport const k = 1;\n";
+        for lang in [Lang::TypeScript, Lang::Tsx, Lang::JavaScript] {
+            assert_eq!(
+                sources(ts, lang),
+                ["./y", "./all", "./ns", "./z"],
+                "{lang:?}"
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("y.ts"), "").unwrap();
+        fs::write(tmp.path().join("z.ts"), "").unwrap();
+        let related = resolve_related_files_with_content(
+            &tmp.path().join("index.ts"),
+            "export { y } from \"./y\";\nimport { z } from \"./z\";\n",
+        );
+        assert_eq!(related, [tmp.path().join("y.ts"), tmp.path().join("z.ts")]);
     }
 
     #[test]

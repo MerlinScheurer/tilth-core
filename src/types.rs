@@ -69,7 +69,7 @@ pub struct OutlineEntry {
     pub start_line: u32,
     pub end_line: u32,
     pub signature: Option<String>,
-    pub children: Vec<OutlineEntry>,
+    pub children: Vec<Self>,
     pub doc: Option<String>,
     /// For an entry exported under another name (`export { readPlan as
     /// parsePlan }`, whose `name` is `parsePlan`), the name it refers to:
@@ -94,19 +94,19 @@ pub enum OutlineKind {
     // Property is constructed in lang/outline.rs (property_declaration nodes).
     Property,
     Module,
-    // Reserved/roadmap: no tree-sitter grammar currently emits TestSuite nodes.
-    #[allow(dead_code)]
-    TestSuite,
-    // Reserved/roadmap: no tree-sitter grammar currently emits TestCase nodes.
-    #[allow(dead_code)]
-    TestCase,
 }
 
 /// Detect test files by path patterns.
 #[must_use]
 pub fn is_test_file(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
-    s.contains(".test.") || s.contains(".spec.") || s.contains("__tests__/")
+    s.contains(".test.")
+        || s.contains(".spec.")
+        || s.contains("__tests__/")
+        || path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.ends_with("_test.go") || (name.starts_with("test_") && name.ends_with(".py"))
+        })
 }
 
 /// UTF-8 safe string truncation. Never panics on multi-byte characters.
