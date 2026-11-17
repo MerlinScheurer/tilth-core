@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use streaming_iterator::StreamingIterator;
 
 use crate::lang::outline::{get_outline_entries, outline_language};
+use crate::lang::treesitter::compiled_query;
 use crate::types::{Lang, OutlineEntry};
 
 /// A resolved callee: a function/method called from within an expanded definition.
@@ -20,8 +21,12 @@ pub struct ResolvedCallee {
 #[derive(Debug)]
 pub struct ResolvedCalleeNode {
     pub callee: ResolvedCallee,
-    /// 2nd-hop callees resolved from within this callee's body.
+    /// 2nd-hop callees resolved from within this callee's body, as many as
+    /// the shared budget had left.
     pub children: Vec<ResolvedCallee>,
+    /// How many 2nd-hop callees this callee has. More than `children.len()`
+    /// when the budget cut some.
+    pub children_found: usize,
 }
 
 /// Extract names of functions/methods called within a given line range.
@@ -57,48 +62,44 @@ pub fn extract_callee_names(
 
     let callee_filter = crate::lang::spec::spec(lang).callee_filter;
 
-    let Some(names) = super::callee_query::with_callee_query(&ts_lang, query_str, |query| {
-        let Some(callee_idx) = query.capture_index_for_name("callee") else {
-            return Vec::new();
-        };
-
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
-        let mut names: Vec<String> = Vec::new();
-
-        while let Some(m) = matches.next() {
-            for cap in m.captures() {
-                if cap.index != callee_idx {
-                    continue;
-                }
-
-                // 1-indexed line number of the capture
-                let line = cap.node.start_position().row as u32 + 1;
-
-                // Filter by def_range if provided
-                if let Some((start, end)) = def_range {
-                    if line < start || line > end {
-                        continue;
-                    }
-                }
-
-                // Some patterns match more than a call (see `callee_filter`).
-                if callee_filter.is_some_and(|keep| !keep(&cap.node)) {
-                    continue;
-                }
-
-                if let Ok(text) = cap.node.utf8_text(content_bytes) {
-                    names.push(text.to_string());
-                }
-            }
-        }
-
-        names
-    }) else {
+    let Some(query) = compiled_query(&ts_lang, query_str) else {
+        return Vec::new();
+    };
+    let Some(callee_idx) = query.capture_index_for_name("callee") else {
         return Vec::new();
     };
 
-    let mut names = names;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
+    let mut names: Vec<String> = Vec::new();
+
+    while let Some(m) = matches.next() {
+        for cap in m.captures() {
+            if cap.index != callee_idx {
+                continue;
+            }
+
+            // 1-indexed line number of the capture
+            let line = cap.node.start_position().row as u32 + 1;
+
+            // Filter by def_range if provided
+            if let Some((start, end)) = def_range {
+                if line < start || line > end {
+                    continue;
+                }
+            }
+
+            // Some patterns match more than a call (see `callee_filter`).
+            if callee_filter.is_some_and(|keep| !keep(&cap.node)) {
+                continue;
+            }
+
+            if let Ok(text) = cap.node.utf8_text(content_bytes) {
+                names.push(text.to_string());
+            }
+        }
+    }
+
     names.sort();
     names.dedup();
 
@@ -296,7 +297,7 @@ fn resolve_same_package(
             break;
         }
 
-        let Ok(content) = crate::source::read_source(&go_path) else {
+        let Ok(Some(content)) = crate::source::read_source(&go_path) else {
             continue;
         };
 
@@ -305,70 +306,52 @@ fn resolve_same_package(
     }
 }
 
-/// Resolve callees transitively up to `depth_limit` hops with budget cap.
+/// The 2nd hop under each of `parents`: the callees its body calls.
 ///
-/// First hop uses `resolve_callees()` on the source content. For each resolved
-/// callee at depth < `depth_limit`, reads the callee's file, extracts nested
-/// callee names from the definition range, and resolves them as children.
-///
-/// `budget` caps the total number of 2nd-hop (child) callees across all parents.
-/// Cycle detection prevents infinite loops via `(file, start_line)` tracking.
+/// `parents` are the callees the caller shows, in the order it shows them,
+/// and `first_hop` is every callee the definition calls. `budget` caps the
+/// 2nd-hop callees kept across all parents, in that order. Each parent still
+/// resolves all of its own, so its node counts what the budget cut. A 2nd-hop
+/// callee is left out when it is in `first_hop` or kept under an earlier
+/// parent, which also stops cycles.
 #[must_use]
-pub fn resolve_callees_transitive(
-    initial_names: &[String],
-    source_path: &Path,
-    source_content: &str,
+pub fn resolve_second_hops(
+    parents: Vec<ResolvedCallee>,
+    first_hop: &[ResolvedCallee],
     bloom: &crate::index::bloom::BloomFilterCache,
-    depth_limit: u32,
     budget: usize,
 ) -> Vec<ResolvedCalleeNode> {
-    // 1st hop: resolve direct callees (existing logic)
-    let first_hop = resolve_callees(initial_names, source_path, source_content, bloom);
-
-    if depth_limit < 2 || first_hop.is_empty() {
-        return first_hop
-            .into_iter()
-            .map(|c| ResolvedCalleeNode {
-                callee: c,
-                children: Vec::new(),
-            })
-            .collect();
-    }
-
-    // Cycle detection: track visited (file, start_line) pairs
-    let mut visited: HashSet<(PathBuf, u32)> = HashSet::new();
-
-    // Mark all 1st-hop callees as visited
-    for c in &first_hop {
-        visited.insert((c.file.clone(), c.start_line));
-    }
-
+    let mut visited: HashSet<(PathBuf, u32)> = first_hop
+        .iter()
+        .map(|c| (c.file.clone(), c.start_line))
+        .collect();
     let mut budget_remaining = budget;
-    let mut result = Vec::with_capacity(first_hop.len());
+    let mut nodes = Vec::with_capacity(parents.len());
 
-    for parent in first_hop {
-        let children = if budget_remaining > 0 {
-            resolve_second_hop(&parent, bloom, &mut visited, &mut budget_remaining)
-        } else {
-            Vec::new()
-        };
-        result.push(ResolvedCalleeNode {
+    for parent in parents {
+        let mut children = resolve_second_hop(&parent, bloom, &visited);
+        let children_found = children.len();
+        children.truncate(budget_remaining);
+        budget_remaining -= children.len();
+        visited.extend(children.iter().map(|c| (c.file.clone(), c.start_line)));
+        nodes.push(ResolvedCalleeNode {
             callee: parent,
             children,
+            children_found,
         });
     }
 
-    result
+    nodes
 }
 
-/// Resolve 2nd-hop callees for a single parent callee.
+/// Resolve 2nd-hop callees for a single parent callee, leaving out the
+/// parent itself and every callee already `visited`.
 fn resolve_second_hop(
     parent: &ResolvedCallee,
     bloom: &crate::index::bloom::BloomFilterCache,
-    visited: &mut HashSet<(PathBuf, u32)>,
-    budget: &mut usize,
+    visited: &HashSet<(PathBuf, u32)>,
 ) -> Vec<ResolvedCallee> {
-    let Ok(content) = crate::source::read_source(&parent.file) else {
+    let Ok(Some(content)) = crate::source::read_source(&parent.file) else {
         return Vec::new();
     };
     let file_type = crate::lang::detect_file_type_with_content(&parent.file, &content);
@@ -398,17 +381,6 @@ fn resolve_second_hop(
         }
         true
     });
-
-    // Apply budget cap
-    if resolved.len() > *budget {
-        resolved.truncate(*budget);
-    }
-
-    // Mark children as visited and decrement budget
-    for c in &resolved {
-        visited.insert((c.file.clone(), c.start_line));
-    }
-    *budget = budget.saturating_sub(resolved.len());
 
     resolved
 }
