@@ -590,7 +590,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tilth-core"
+name = "tilth-core-fork"
 version = "0.15.0"
 dependencies = [
  "dashmap",
